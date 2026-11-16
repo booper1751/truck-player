@@ -1,17 +1,130 @@
 # -*- coding: utf-8 -*-
 """卡車播放器 (Qt 版)  —  勾選資料夾 + 播放清單 + 播放次數排行榜 + 桌布背景(面板半透明)
-第一次執行會自動安裝: PySide6 (介面)、pygame (播放)、keyboard (全域快捷鍵，可選)
+.py 執行: 第一次會自動安裝 PySide6 (介面)、pygame (播放)、mutagen、keyboard (全域快捷鍵，可選)
+EXE 執行: 套件已包在裡面。第一次執行會自動安裝到 %LOCALAPPDATA%\\TruckPlayer、在桌面建立捷徑；
+          最小化時收進系統匣；更新走 GitHub Releases。
 全域快捷鍵: F9 上一首 / F10 播放暫停 / F11 下一首
 資料: 同資料夾的 player_config.json 與 player_stats.db (與舊 Tk 版共用，次數會保留)
 不會修改、搬動你的任何音樂檔。"""
-import ast, ctypes, datetime, hashlib, importlib, importlib.util, json, os, random, re, shutil, sqlite3, subprocess, sys, threading, time, urllib.request
+import ast, ctypes, datetime, hashlib, importlib, importlib.util, json, os, random, re, shutil, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request
 
-VERSION = 11     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
-UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
+VERSION = 12     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # (.py 版) 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
 UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
+RELEASE_ASSET = "TruckPlayer.exe"             # (EXE 版) Releases 裡要下載的檔名，要跟 build.yml 打包出來的檔名一致
+
+FROZEN = bool(getattr(sys, "frozen", False))  # True = 已打包成 EXE
+SCRIPT = sys.executable if FROZEN else os.path.abspath(__file__)
+HERE = os.path.dirname(SCRIPT)
+
+APP_NAME = "TruckPlayer"
+INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP_NAME)
+INSTALL_EXE = os.path.join(INSTALL_DIR, APP_NAME + ".exe")
+SHORTCUT_NAME = "卡車播放器.lnk"
+MIGRATE_FILES = ("player_config.json", "player_stats.db", "update_source.json")   # 第一次安裝時，順便帶過去 (如果 EXE 旁邊本來就有)
 
 LAST_ERR = ""
+
+
+def message_box(text, title="卡車播放器"):
+    """Windows 原生訊息框 (不需要 Qt，打包成沒有黑視窗的 EXE 時也能用)"""
+    try:
+        if os.name == "nt":
+            ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
+        else:
+            print(title + ":", text)
+    except Exception:
+        pass
+
+
+def spawn_self(path=None):
+    """另外開一個獨立的新程式 (更新後重啟、首次安裝後開啟安裝好的那份)。
+    EXE 是「單檔版」時，子程式不能沿用舊的暫存解壓目錄，所以要清掉 PyInstaller 的環境變數。"""
+    if FROZEN:
+        env = os.environ.copy()
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        for k in [k for k in env if k.startswith("_PYI") or k == "_MEIPASS2"]:
+            env.pop(k, None)
+        flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen([path or SCRIPT], env=env, creationflags=flags, close_fds=True, cwd=os.path.dirname(path or SCRIPT))
+    else:
+        subprocess.Popen([sys.executable, SCRIPT])
+
+
+def desktop_dir():
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(0, 0x10, 0, 0, buf) == 0 and buf.value:     # CSIDL_DESKTOPDIRECTORY
+            return buf.value
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
+def make_desktop_shortcut(target=INSTALL_EXE):
+    """在桌面建立捷徑 (用 Windows 內建 PowerShell，不需要任何套件)。成功回傳捷徑路徑，失敗回傳 None。"""
+    lnk = os.path.join(desktop_dir(), SHORTCUT_NAME)
+    if os.path.exists(lnk):
+        return lnk
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:TP_LNK);"
+          "$s.TargetPath=$env:TP_TARGET;$s.WorkingDirectory=$env:TP_DIR;$s.IconLocation=$env:TP_TARGET+',0';$s.Save()")
+    env = dict(os.environ, TP_LNK=lnk, TP_TARGET=target, TP_DIR=os.path.dirname(target))
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], env=env,
+                       creationflags=0x08000000 if os.name == "nt" else 0, capture_output=True, timeout=30)
+    except Exception:
+        return None
+    return lnk if os.path.exists(lnk) else None
+
+
+def maybe_install():
+    """EXE 第一次執行 (不在安裝資料夾裡) 時: 建資料夾 → 把自己複製進去 → 桌面建捷徑 → 開啟安裝好的那份 → 結束這一份。
+    已經安裝過了就不覆蓋 (版本由程式內的自動更新處理)。複製失敗時，就直接在原地執行。"""
+    if os.path.normcase(os.path.abspath(HERE)) == os.path.normcase(os.path.abspath(INSTALL_DIR)):
+        return
+    fresh = not os.path.exists(INSTALL_EXE)
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        if fresh:
+            tmp = INSTALL_EXE + ".tmp"
+            shutil.copy2(SCRIPT, tmp)
+            os.replace(tmp, INSTALL_EXE)
+            for fn in MIGRATE_FILES:
+                src, dst = os.path.join(HERE, fn), os.path.join(INSTALL_DIR, fn)
+                if os.path.exists(src) and not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+    except OSError as e:
+        message_box(f"無法安裝到:\n{INSTALL_DIR}\n\n原因: {e}\n\n這次會直接在目前的位置執行。")
+        return
+    lnk = make_desktop_shortcut()
+    try:
+        spawn_self(INSTALL_EXE)
+    except Exception as e:
+        message_box(f"安裝好了，但無法自動開啟:\n{INSTALL_EXE}\n\n原因: {e}")
+        sys.exit(0)
+    if fresh:
+        msg = f"已安裝到:\n{INSTALL_DIR}\n\n" + ("桌面已建立「卡車播放器」捷徑，之後請從桌面開啟。" if lnk else "桌面捷徑建立失敗，請到上面的資料夾直接開啟。")
+        message_box(msg + "\n\n你下載的這個檔案已經用不到，可以刪除。")
+    sys.exit(0)
+
+
+def cleanup_old_files():
+    """清掉上次更新留下的舊檔 (.old / .new)；刪不掉就留著，下次再試"""
+    base = os.path.basename(SCRIPT)
+    try:
+        for fn in os.listdir(HERE):
+            if fn.startswith(base + ".old") or fn == base + ".new":
+                try:
+                    os.remove(os.path.join(HERE, fn))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+if FROZEN and os.name == "nt" and "--no-install" not in sys.argv:
+    maybe_install()
 
 
 def _pip(pkg):
@@ -42,24 +155,28 @@ def ensure_deps():
     print("Python 版本:", sys.version.split()[0])
 
 
-ensure_deps()
+if not FROZEN:
+    ensure_deps()
 try:
-    from PySide6.QtCore import QEasingCurve, QObject, QPoint, QRect, QSize, Qt, QTimer, QVariantAnimation, Signal
-    from PySide6.QtGui import QColor, QFont, QIntValidator, QImage, QPainter, QPixmap, QRadialGradient, QLinearGradient, QBrush
+    from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
+    from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QIntValidator, QImage, QPainter, QPixmap, QPolygonF, QRadialGradient,
+                               QLinearGradient, QBrush)
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                                   QLineEdit, QListWidget, QListWidgetItem, QPushButton, QSizeGrip, QSlider,
+                                   QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizeGrip, QSlider, QSystemTrayIcon,
                                    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView, QMessageBox, QStyle, QProgressBar, QGraphicsDropShadowEffect)
 except ImportError as e:
     print("PySide6 安裝失敗:", e, "\n", LAST_ERR)
-    input("按 Enter 結束")
+    if FROZEN:
+        message_box(f"程式缺少必要元件，無法啟動:\n{e}")
+    else:
+        input("按 Enter 結束")
     sys.exit(1)
 try:
     import pygame
 except ImportError:
     pygame = None
 
-SCRIPT = os.path.abspath(__file__)
-HERE = os.path.dirname(SCRIPT)
 CFG = os.path.join(HERE, "player_config.json")
 DB = os.path.join(HERE, "player_stats.db")
 EXTS = (".mp3", ".flac", ".wav", ".ogg", ".m4a")
@@ -77,6 +194,54 @@ THEMES = {
     "星空黑":      dict(tint=(6, 8, 28), text="#eef0ff", sub="#9aa5d8", accent="#8b6cff", base=(7, 10, 26), stars=True),
     "淺色":        dict(tint=(245, 245, 247), text="#1c1c1e", sub="#555560", accent="#2b6cb0", base=(230, 230, 235)),
 }
+
+
+# ---------------- 圖示 (播放鍵，用程式畫出來，不需要圖檔) ----------------
+# 設計 (和 make_icon.py 產生 EXE 檔案圖示 icon.ico 的數字一致): 藍紫圓角方塊 + 白色播放三角形
+ICON_BG = "#5865f2"
+ICON_RADIUS = 0.22
+ICON_TRI = ((0.36, 0.25), (0.36, 0.75), (0.76, 0.50))
+
+
+def play_pixmap(size):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(ICON_BG))
+    p.drawRoundedRect(QRectF(0, 0, size, size), size * ICON_RADIUS, size * ICON_RADIUS)
+    p.setBrush(QColor("#ffffff"))
+    p.drawPolygon(QPolygonF([QPointF(x * size, y * size) for x, y in ICON_TRI]))
+    p.end()
+    return pm
+
+
+def app_icon():
+    ic = QIcon()
+    for s in (16, 24, 32, 48, 64, 128, 256):
+        ic.addPixmap(play_pixmap(s))
+    return ic
+
+
+# ---------------- 單一執行個體 (已經開著就把它叫出來，不要開第二個) ----------------
+SINGLE_NAME = "TruckPlayer.SingleInstance"
+
+
+def single_instance():
+    """回傳 QLocalServer (這是第一個執行個體)；回傳 None 代表已經有一個在跑，已通知它顯示視窗，這個應該直接結束"""
+    sock = QLocalSocket()
+    sock.connectToServer(SINGLE_NAME)
+    if sock.waitForConnected(300):
+        sock.write(b"show")
+        sock.flush()
+        sock.waitForBytesWritten(300)
+        sock.disconnectFromServer()
+        return None
+    QLocalServer.removeServer(SINGLE_NAME)          # 清掉上次異常結束留下的殘骸
+    srv = QLocalServer()
+    srv.listen(SINGLE_NAME)
+    return srv
 
 
 # ---------------- 資料庫 ----------------
@@ -143,6 +308,7 @@ def load_cfg():
     c.setdefault("chime_half", True)       # 半點報時
     c.setdefault("chime_ampm", False)      # 報時加上「上午/下午」
     c.setdefault("folders_open", True)     # 左側資料夾面板是否展開
+    c.setdefault("tray_min", True)         # 視窗最小化時收進系統匣 (右下角小圖示)
     c.setdefault("repeat", 0)              # 0=不循環 1=全部循環 2=單曲循環
     if c["repeat"] not in (0, 1, 2):
         c["repeat"] = 0
@@ -561,8 +727,53 @@ def file_update_src():
         return ""
 
 
+def bundled_repo():
+    """EXE 版: 打包時由 GitHub Actions 寫進 EXE 裡的 build_info.json {"repo": "帳號/倉庫"}，所以原始碼裡不會有帳號"""
+    try:
+        with open(os.path.join(getattr(sys, "_MEIPASS", HERE), "build_info.json"), encoding="utf-8") as f:
+            return str(json.load(f).get("repo", "")).strip()
+    except Exception:
+        return ""
+
+
 def default_src():
-    return UPDATE_SRC_DEFAULT.strip() or file_update_src()
+    return UPDATE_SRC_DEFAULT.strip() or file_update_src() or (bundled_repo() if FROZEN else "")
+
+
+def parse_repo(text):
+    """從 「帳號/倉庫」 或任何 github.com / raw.githubusercontent.com 網址取出 帳號/倉庫 (EXE 版用)"""
+    t = re.sub(r"[?#].*$", "", (text or "").strip()).rstrip("/")
+    t = re.sub(r"^https?://", "", t)
+    t = re.sub(r"^(?:www\.)?(?:github\.com|raw\.githubusercontent\.com)/", "", t)
+    m = re.match(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/.*)?$", t)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def check_release(src):
+    """EXE 版: 查倉庫最新 Release。回傳 dict: ok, version, url(EXE 下載網址), size 或 error"""
+    repo = parse_repo(src)
+    if not repo:
+        return {"ok": False, "error": "看不懂這個更新來源。請填「帳號/倉庫」。"}
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
+                                 headers={"User-Agent": "truck-player-updater", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read(2 * 1024 * 1024).decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"ok": False, "error": "找不到已發布的版本 (Releases)。請確認倉庫是公開的，而且已經打包出第一個版本。"}
+        if e.code in (403, 429):
+            return {"ok": False, "error": "GitHub 暫時限制查詢次數，請稍後再試。"}
+        return {"ok": False, "error": f"連不上 GitHub (HTTP {e.code})。"}
+    except Exception as e:
+        return {"ok": False, "error": f"連不上 GitHub ({e})。請確認網路連線。"}
+    m = re.search(r"\d+", str(data.get("tag_name", "")))
+    if not m:
+        return {"ok": False, "error": "最新的 Release 沒有版本號 (標籤要像 v12)。"}
+    asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).lower() == RELEASE_ASSET.lower()), None)
+    if not asset or not asset.get("browser_download_url"):
+        return {"ok": False, "error": f"最新的 Release 裡找不到 {RELEASE_ASSET}。"}
+    return {"ok": True, "version": int(m.group()), "url": asset["browser_download_url"], "size": int(asset.get("size") or 0)}
 
 
 def parse_update_source(text):
@@ -599,7 +810,9 @@ def read_version(text):
 
 
 def check_remote(src):
-    """回傳 dict: ok, version, text, url 或 error"""
+    """回傳 dict: ok, version, text, url 或 error  (EXE 版改查 Releases，見 check_release)"""
+    if FROZEN:
+        return check_release(src)
     urls = parse_update_source(src)
     if not urls:
         return {"ok": False, "error": "看不懂這個網址。請貼 GitHub 上檔案的網址，或「帳號/倉庫」。"}
@@ -633,11 +846,12 @@ class UpdateDialog(QDialog):
         self.resize(640, 360)
         v = QVBoxLayout(self)
         v.addWidget(QLabel(f"目前版本：v{VERSION}"))
-        v.addWidget(QLabel("更新來源 (GitHub 檔案網址，或 帳號/倉庫):"))
+        v.addWidget(QLabel("更新來源 (帳號/倉庫):" if FROZEN else "更新來源 (GitHub 檔案網址，或 帳號/倉庫):"))
         self.src = QLineEdit(pl.cfg["update_src"] or default_src())
-        self.src.setPlaceholderText("例如 https://github.com/帳號/倉庫/blob/main/ets2_player_qt.py")
+        self.src.setPlaceholderText("例如 帳號/倉庫" if FROZEN else "例如 https://github.com/帳號/倉庫/blob/main/ets2_player_qt.py")
         v.addWidget(self.src)
-        hint = QLabel(f"只填「帳號/倉庫」時，會抓 main (或 master) 分支裡的 {UPDATE_DEFAULT_FILE}。倉庫需要是公開的。")
+        hint = QLabel(f"會到這個倉庫的 Releases 找最新版的 {RELEASE_ASSET}。倉庫需要是公開的。" if FROZEN else
+                      f"只填「帳號/倉庫」時，會抓 main (或 master) 分支裡的 {UPDATE_DEFAULT_FILE}。倉庫需要是公開的。")
         hint.setObjectName("sub")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -680,7 +894,7 @@ class UpdateDialog(QDialog):
             self.status.setText("⚠ " + res["error"])
         elif res["version"] > VERSION:
             self.status.setText(f"發現新版本 v{res['version']} (目前 v{VERSION})。\n按「下載並更新」會下載、換掉目前的程式檔，然後自動重新啟動。\n"
-                                "舊版會備份成同名的 .bak 檔；設定、播放次數都不會變。")
+                                ("舊版會暫時改名成 .old，重新開啟後自動清掉；" if FROZEN else "舊版會備份成同名的 .bak 檔；") + "設定、播放次數都不會變。")
             self.go.setText(f"下載並更新到 v{res['version']}")
             self.go.show()
         elif res["version"] == VERSION:
@@ -759,6 +973,23 @@ def fetch_stream(url, cb, timeout=20):
     return bytes(buf).decode("utf-8")
 
 
+def fetch_file(url, dest, cb, timeout=30, limit=400 * 1024 * 1024):
+    """分段下載成檔案並回報進度 cb(已下載位元組, 總位元組或0)"""
+    req = urllib.request.Request(url, headers={"User-Agent": "truck-player-updater", "Cache-Control": "no-cache"})
+    got = 0
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            if got > limit:
+                raise ValueError("檔案異常大")
+            cb(got, total)
+
+
 class UpdateWorker(QObject):
     progress = Signal(int, str)        # (目標百分比, 目前步驟文字)
     done = Signal(bool, str)           # (成功與否, 訊息)
@@ -770,9 +1001,51 @@ class UpdateWorker(QObject):
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
+    def _run_exe(self, res):
+        """EXE 版: 下載新 EXE → 驗證 → 把正在執行的舊 EXE 改名成 .old (Windows 允許改名但不允許覆蓋) → 新檔放到原本的名字"""
+        tmp = SCRIPT + ".new"
+        try:
+            self.progress.emit(2, "正在連線到 GitHub …")
+
+            def cb(got, total):
+                total = total or res.get("size") or 0
+                pct = 5 + int(75 * got / total) if total else 40
+                self.progress.emit(min(pct, 80), f"下載最新版 … {got / 1048576:.1f} MB" + (f" / {total / 1048576:.1f} MB" if total else ""))
+            fetch_file(res["url"], tmp, cb)
+            self.progress.emit(82, "檢查檔案是否完整 …")
+            with open(tmp, "rb") as f:
+                head = f.read(2)
+            if head != b"MZ" or (res.get("size") and os.path.getsize(tmp) != res["size"]):
+                raise ValueError("下載到的檔案不完整")
+            self.progress.emit(88, "備份目前的版本 …")
+            old = SCRIPT + ".old"
+            if os.path.exists(old):
+                try:
+                    os.remove(old)
+                except OSError:
+                    old = SCRIPT + f".old{int(time.time())}"      # 舊的 .old 刪不掉 (還被占用)，改用不重複的名字，下次啟動再清
+            os.replace(SCRIPT, old)
+            self.progress.emit(95, "安裝新版 …")
+            try:
+                os.replace(tmp, SCRIPT)
+            except OSError:
+                os.replace(old, SCRIPT)                           # 放不上去就把舊版改回來，保證程式還在
+                raise
+            self.progress.emit(100, "更新完成！")
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
     def _run(self):
         res = self.res
         try:
+            if FROZEN:
+                self._run_exe(res)
+                self.done.emit(True, "")
+                return
             self.progress.emit(2, "正在連線到 GitHub …")
 
             def cb(got, total):
@@ -1103,6 +1376,10 @@ class Player(QWidget):
         self.resize(1280, 760)
         self.setMinimumSize(900, 520)
         self.setAttribute(Qt.WA_StyledBackground, False)
+        self.setWindowIcon(app_icon())
+        self.single = None              # 單一執行個體的 QLocalServer (由 main 設定)
+        self._tray_hinted = False       # 第一次收進系統匣時，跳一次提示
+        self._tray_tip = ""
 
         if pygame is None:
             QMessageBox.critical(self, "缺少 pygame", "自動安裝失敗。\n" + (LAST_ERR or ""))
@@ -1111,6 +1388,7 @@ class Player(QWidget):
         pygame.mixer.music.set_volume(self.cfg["volume"] / 100)
 
         self._build()
+        self._make_tray()
         self._apply_folders_open()
         self._apply_drawer(animate=False)
         self.apply_theme()
@@ -1369,6 +1647,74 @@ class Player(QWidget):
         self.pop.setFixedSize(64, 210)
         self._update_vol_icon(self.cfg["volume"])
 
+    # ---------------- 系統匣 (右下角小圖示) ----------------
+    def _make_tray(self):
+        self.tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
+        self.tray = QSystemTrayIcon(app_icon(), self)
+        menu = QMenu()
+        self._tray_menu = menu                      # 要留著參照，不然會被回收
+        for txt, fn in (("顯示視窗", self._show_from_tray), (None, None), ("◀◀ 上一首", self.prev), ("▶ / ❚❚ 播放暫停", self.toggle),
+                        ("▶▶ 下一首", self.next), (None, None)):
+            if txt is None:
+                menu.addSeparator()
+                continue
+            act = QAction(txt, self)
+            act.triggered.connect(fn)
+            menu.addAction(act)
+        self.tray_min_act = QAction("最小化時收進系統匣", self)
+        self.tray_min_act.setCheckable(True)
+        self.tray_min_act.setChecked(self.cfg["tray_min"])
+        self.tray_min_act.toggled.connect(lambda on: (self.cfg.__setitem__("tray_min", on), save_cfg(self.cfg)))
+        menu.addAction(self.tray_min_act)
+        menu.addSeparator()
+        quit_act = QAction("結束", self)
+        quit_act.triggered.connect(self._quit)
+        menu.addAction(quit_act)
+        self.tray.setContextMenu(menu)
+        self.tray.setToolTip("卡車播放器")
+        self.tray.activated.connect(self._tray_clicked)
+        if self.tray_ok:
+            self.tray.show()
+
+    def _tray_clicked(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_from_tray()
+
+    def changeEvent(self, e):
+        if e.type() == QEvent.WindowStateChange and self.isMinimized() and getattr(self, "tray_ok", False) and self.cfg["tray_min"]:
+            QTimer.singleShot(0, self._hide_to_tray)      # 等這一輪事件處理完再隱藏，比較穩
+        super().changeEvent(e)
+
+    def _hide_to_tray(self):
+        self.hide()
+        if not self._tray_hinted:
+            self._tray_hinted = True
+            self.tray.showMessage("卡車播放器", "已收進系統匣，音樂會繼續播放。\n點圖示可以還原；在圖示上按右鍵可以結束，或改回一般最小化。",
+                                  self.tray.icon(), 6000)
+
+    def _show_from_tray(self):
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_single(self):
+        """又有人想開第二個播放器: 把這個叫出來就好"""
+        if self.single:
+            s = self.single.nextPendingConnection()
+            if s:
+                s.readAll()
+                s.disconnectFromServer()
+        self._show_from_tray()
+
+    def _release_single(self):
+        if self.single:
+            self.single.close()
+            self.single = None
+
+    def _quit(self):
+        self.close()
+
     # ---------------- 外觀 ----------------
     def apply_theme(self):
         th = THEMES[self.cfg["theme"]]
@@ -1580,6 +1926,8 @@ class Player(QWidget):
         # 啟動時自動檢查: 有新版才打擾，失敗就靜靜略過
         if res.get("ok") and res["version"] > VERSION and res["version"] != self.cfg["update_skip"]:
             self.toast.show_for(res)          # 左下角小提示框 (按「是」才更新)
+            if not self.isVisible() and self.tray_ok:      # 視窗收在系統匣時，改用氣泡通知
+                self.tray.showMessage("卡車播放器", f"發現新版本 v{res['version']}，點圖示打開視窗就可以更新。", self.tray.icon(), 6000)
 
     def install_update(self, res, parent, quiet=False):
         self.toast.hide()
@@ -1591,8 +1939,9 @@ class Player(QWidget):
 
     def _restart(self):
         save_cfg(self.cfg)
+        self._release_single()            # 先放掉「單一執行個體」的占用，不然新開的那個會以為已經有人在跑而直接結束
         try:
-            subprocess.Popen([sys.executable, SCRIPT])
+            spawn_self()
         except Exception:
             pass
         self.close()
@@ -2033,6 +2382,13 @@ class Player(QWidget):
                 self._auto_next()
         self.last_tick = now
         self._clock_tick()
+        tip = "卡車播放器"
+        if self.cur:
+            tip += ("  (暫停) " if self.paused else "  ▶ ") + os.path.splitext(os.path.basename(self.cur[1]))[0]
+        tip = tip[:120]                   # Windows 提示文字最長約 127 字
+        if tip != self._tray_tip:
+            self._tray_tip = tip
+            self.tray.setToolTip(tip)
         if not self.seek.dragging:
             self.seek.blockSignals(True)
             if self.cur:
@@ -2059,15 +2415,35 @@ class Player(QWidget):
 
     def closeEvent(self, e):
         save_cfg(self.cfg)
+        self._release_single()
+        try:
+            self.tray.hide()              # 不隱藏的話，程式結束後系統匣會殘留一個死掉的圖示
+        except Exception:
+            pass
         try:
             pygame.mixer.quit()
         except Exception:
             pass
         super().closeEvent(e)
+        QApplication.instance().quit()    # 視窗可以收在系統匣不結束程式，所以關閉視窗時要明確結束
 
 
 if __name__ == "__main__":
+    if FROZEN:
+        cleanup_old_files()
+    if os.name == "nt":
+        try:    # 讓工作列用我們自己的播放鍵圖示，而不是 Python 的
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TruckPlayer.App")
+        except Exception:
+            pass
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # 視窗收進系統匣時不要結束程式
+    app.setWindowIcon(app_icon())
+    srv = single_instance()
+    if srv is None:                       # 已經有一個在跑了，剛剛已經請它把視窗叫出來
+        sys.exit(0)
     w = Player()
+    w.single = srv
+    srv.newConnection.connect(w._on_single)
     w.show()
     sys.exit(app.exec())
