@@ -1,0 +1,76 @@
+name: Build EXE
+
+# 你把新的 ets2_player_qt.py (VERSION 加 1) 上傳到倉庫 -> 這裡自動在 Windows 雲端電腦打包 -> 發布成 Release。
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "ets2_player_qt.py"
+      - "icon.ico"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 讀取版本號，檢查這一版是不是已經發布過
+        id: ver
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(python -c "import re;print(re.search(r'^VERSION\s*=\s*(\d+)',open('ets2_player_qt.py',encoding='utf-8').read(),re.M).group(1))")
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+          if gh release view "v$V" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::v$V 已經發布過了，略過打包。要發新版請把 ets2_player_qt.py 裡的 VERSION 加 1。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安裝打包需要的套件
+        if: steps.ver.outputs.exists == 'false'
+        shell: bash
+        run: pip install pyinstaller PySide6-Essentials pygame mutagen keyboard
+
+      - name: 把倉庫名稱寫進程式 (程式靠它找更新，原始碼裡不會有你的帳號)
+        if: steps.ver.outputs.exists == 'false'
+        shell: bash
+        run: |
+          printf '{"repo": "%s"}' "$GITHUB_REPOSITORY" > build_info.json
+          cat build_info.json
+
+      - name: 打包成單一 EXE
+        if: steps.ver.outputs.exists == 'false'
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --name TruckPlayer \
+            --icon icon.ico \
+            --add-data "build_info.json;." \
+            --hidden-import keyboard \
+            ets2_player_qt.py
+          ls -la dist/
+
+      - name: 發布 Release
+        if: steps.ver.outputs.exists == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.ver.outputs.v }}" dist/TruckPlayer.exe \
+            -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v${{ steps.ver.outputs.v }}" \
+            --notes "自動打包的第 ${{ steps.ver.outputs.v }} 版。下載 TruckPlayer.exe 直接執行即可，已經在用的人會自動收到更新提示。" \
+            --latest
