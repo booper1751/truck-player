@@ -6,7 +6,27 @@
 不會修改、搬動你的任何音樂檔。"""
 import ast, ctypes, datetime, hashlib, importlib, importlib.util, io, json, os, random, re, shutil, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, zipfile
 
-VERSION = 15     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+
+def _setup_ssl():
+    """讓所有 urllib 連線 (下載 ffmpeg / yt-dlp、天氣、更新) 同時信任「Windows 憑證庫」和 certifi 內建的憑證。
+    有些電腦的 Windows 憑證庫不完整 (沒更新過、或防毒軟體換過憑證)，只靠系統憑證會出現 CERTIFICATE_VERIFY_FAILED。
+    憑證驗證本身仍然開著，沒有關掉。"""
+    try:
+        import ssl
+        ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(cafile=certifi.where())
+        except Exception:
+            pass
+        urllib.request.install_opener(urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx)))
+    except Exception:
+        pass
+
+
+_setup_ssl()
+
+VERSION = 18     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
 UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
@@ -339,11 +359,13 @@ def load_cfg():
     c.setdefault("weather_lon", None)
     c.setdefault("chime_weather", True)    # 報時時一併報氣溫
     c.setdefault("chime_weather_extra", False)   # 也報天氣狀況與降雨機率
+    c.setdefault("wx_daily", False)        # 每天早上7點、中午12點、晚上7點固定報天氣與降雨機率
     c.setdefault("close_to_tray", False)   # 按 ✕ 時是否縮到系統匣
     c.setdefault("tray_tip_shown", False)  # 第一次縮到系統匣時的說明氣泡是否已顯示
     c.setdefault("voice", "")              # 報時女聲 (空白 = 自動)
     c.setdefault("voice_rate", 0)          # 語速 -5 (慢) ~ +5 (快)
     c.setdefault("folders_open", True)     # 左側資料夾面板是否展開
+    c.setdefault("tools_open", True)       # 資料夾清單下面那一排按鈕是否展開 (可收成一條橫桿，讓清單變高)
     c.setdefault("repeat", 0)              # 0=不循環 1=全部循環 2=單曲循環
     if c["repeat"] not in (0, 1, 2):
         c["repeat"] = 0
@@ -1759,7 +1781,13 @@ class DownloadDialog(QDialog):
         self.status.setText("準備就緒" if not msgs else "⚠️ 元件安裝失敗")
         self.refresh_tools()
         if msgs:
-            QMessageBox.warning(self, "元件安裝失敗", "\n".join(msgs) + "\n\n請檢查網路連線，再按上方的「重新下載」按鈕重試。")
+            tip = "\n\n請檢查網路連線，再按上方的「重新下載」按鈕重試。"
+            if any("CERTIFICATE" in m or "SSL" in m for m in msgs):
+                tip = ("\n\n這是電腦上的憑證不完整造成的。可以試試:\n"
+                       "1. 先到 Windows Update 更新、重新開機，再按「重新下載」\n"
+                       "2. 暫時關閉防毒軟體的「HTTPS / 網頁防護掃描」，再按「重新下載」\n"
+                       "3. 自己下載 ffmpeg，把 ffmpeg.exe 放進這個資料夾:\n" + TOOLS_DIR)
+            QMessageBox.warning(self, "元件安裝失敗", "\n".join(msgs) + tip)
 
     # ---- 下載 ----
     def start_download(self):
@@ -2345,7 +2373,7 @@ def fetch_weather_openmeteo(lat, lon):
     return {"ts": time.time(), "temp": cur.get("temperature_2m"), "code": cur.get("weather_code"), "days": days}
 
 
-_CWA_CACHE = {"ts": 0.0, "data": None}
+_CWA_CACHE = {"ts": 0.0, "data": None, "etag": None}
 
 
 def cwa_url():
@@ -2358,16 +2386,37 @@ def cwa_url():
     return f"https://raw.githubusercontent.com/{rp[0]}/{rp[1]}/weather-data/weather.json"
 
 
+def fetch_cwa_json(url, timeout=20):
+    """讀 weather.json。省流量: 要求壓縮傳輸 (約 8KB)，並帶上次的 ETag，資料沒變時伺服器只回「沒變」(幾乎 0 流量)。"""
+    hdr = {"User-Agent": "ets2-player-updater", "Accept-Encoding": "gzip"}
+    if _CWA_CACHE.get("etag") and _CWA_CACHE["data"]:
+        hdr["If-None-Match"] = _CWA_CACHE["etag"]
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=timeout) as r:
+            raw = r.read(3 * 1024 * 1024 + 1)
+            etag, enc = r.headers.get("ETag"), (r.headers.get("Content-Encoding") or "").lower()
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and _CWA_CACHE["data"]:
+            return _CWA_CACHE["data"], _CWA_CACHE.get("etag")
+        raise
+    if len(raw) > 3 * 1024 * 1024:
+        raise ValueError("檔案異常大")
+    if enc == "gzip":
+        import gzip
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8")), etag
+
+
 def cwa_data(force=False):
     if not force and _CWA_CACHE["data"] and time.time() - _CWA_CACHE["ts"] < 600:
         return _CWA_CACHE["data"]
     url = cwa_url()
     if not url:
         raise ValueError("沒有設定氣象資料來源")
-    d = fetch_json(url, 20)
+    d, etag = fetch_cwa_json(url, 20)
     if not d.get("stations") or not d.get("counties"):
         raise ValueError("氣象資料內容不完整")
-    _CWA_CACHE.update(ts=time.time(), data=d)
+    _CWA_CACHE.update(ts=time.time(), data=d, etag=etag)
     return d
 
 
@@ -2380,6 +2429,39 @@ def _km(lat1, lon1, lat2, lon2):
     p = math.pi / 180
     a = math.sin((lat2 - lat1) * p / 2) ** 2 + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2
     return 12742 * math.asin(math.sqrt(a))
+
+
+def _parse_t(t):
+    try:
+        return datetime.datetime.strptime((t or "")[:16].replace("T", " "), "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def period_label(p, now=None):
+    """氣象署 36 小時預報的一個時段 → 「今天白天」「今晚」「明天白天」"""
+    now = now or datetime.datetime.now()
+    st = _parse_t(p.get("s"))
+    if st is None:
+        return p.get("label", "")
+    day = (st.date() - now.date()).days
+    if not (5 <= st.hour < 17):
+        return "今晚" if day <= 0 else ("明晚" if day == 1 else "後天晚上")
+    return "今天白天" if day <= 0 else ("明天白天" if day == 1 else "後天白天")
+
+
+def wx_items(wx, now=None):
+    """要輪流顯示的幾段預報 (最多 3 段)。有時段資料就用時段，否則退回「今天/明天/後天」。"""
+    now = now or datetime.datetime.now()
+    out = []
+    for p in (wx.get("periods") or []):
+        e = _parse_t(p.get("e"))
+        if e is None or e > now:
+            out.append(dict(p, label=period_label(p, now)))
+    if not out:
+        for i, d in enumerate((wx.get("days") or [])[:3]):
+            out.append(dict(d, label=("今天", "明天", "後天")[i]))
+    return out[:3]
 
 
 def fetch_weather_cwa(lat, lon):
@@ -2396,7 +2478,8 @@ def fetch_weather_cwa(lat, lon):
     if not days:
         raise ValueError("沒有收到預報資料")
     d0 = days[0]
-    return {"ts": time.time(), "temp": best.get("temp"), "code": best.get("code") if best.get("wx") else d0.get("code"),
+    return {"ts": time.time(), "data_ts": d.get("ts"), "periods": cd.get("periods") or [],
+            "temp": best.get("temp"), "code": best.get("code") if best.get("wx") else d0.get("code"),
             "text": best.get("wx") or d0.get("text"), "days": days, "src": "cwa",
             "place": (best["c"] + best.get("t", "")) if bd <= 5 else best["c"], "updated": d.get("updated", "")}
 
@@ -2453,6 +2536,10 @@ def geocode(name):
             raise RuntimeError(f"氣象資料讀取失敗 ({err})；備援查詢也失敗 ({last})")
         raise last
     return []
+
+
+def _deg(x):
+    return "?" if x is None else f"{round(x)}°"
 
 
 def fetch_weather(lat, lon):
@@ -2863,6 +2950,7 @@ class Player(QWidget):
 
         self._build()
         self._apply_folders_open()
+        self._apply_tools(animate=False)
         self._apply_drawer(animate=False)
         self._slideshow_changed()
         self.apply_theme()
@@ -2930,30 +3018,47 @@ class Player(QWidget):
         lv = QVBoxLayout(left)
         lv.addWidget(QLabel("音樂資料夾 (勾選才會進清單)"))
         self.folder_list = QListWidget()
+        self.folder_list.setObjectName("folderlist")
+        self.folder_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)       # 捲軸一直顯示，才知道還有更多資料夾
+        self.folder_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)    # 太長的路徑中間改成「…」，不用左右捲
+        self.folder_list.setTextElideMode(Qt.ElideMiddle)
+        self.folder_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.folder_list.itemChanged.connect(self._folder_toggled)
         lv.addWidget(self.folder_list, 1)
+        self.tools_bar = QPushButton("▼")
+        self.tools_bar.setObjectName("drawerbar")
+        self.tools_bar.setFixedHeight(22)
+        self.tools_bar.setToolTip("收起 / 展開下面的按鈕，讓資料夾清單變高")
+        self.tools_bar.clicked.connect(self._toggle_tools)
+        lv.addWidget(self.tools_bar)
+        self.tools_box = QWidget()
+        self.tools_box.setObjectName("toolsbox")
+        tl = QVBoxLayout(self.tools_box)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(lv.spacing())
         hb = QHBoxLayout()
         b1, b2 = QPushButton("＋加入資料夾"), QPushButton("移除未勾選")
         b1.clicked.connect(self.add_folder)
         b2.clicked.connect(self.remove_unchecked)
         hb.addWidget(b1)
         hb.addWidget(b2)
-        lv.addLayout(hb)
+        tl.addLayout(hb)
         b6 = QPushButton("⬇ 下載音樂…")
         b6.clicked.connect(self.open_download)
-        lv.addWidget(b6)
+        tl.addWidget(b6)
         b4 = QPushButton("🔍 找重複歌曲…")
         b4.clicked.connect(self.find_dups)
-        lv.addWidget(b4)
+        tl.addWidget(b4)
         self.hid_btn = QPushButton("🙈 隱藏清單 (0)")
         self.hid_btn.clicked.connect(self.open_hidden)
-        lv.addWidget(self.hid_btn)
+        tl.addWidget(self.hid_btn)
         b3 = QPushButton("重新掃描")
         b3.clicked.connect(self.refresh_tracks)
-        lv.addWidget(b3)
+        tl.addWidget(b3)
         b5 = QPushButton(f"🔄 檢查更新 (v{VERSION})")
         b5.clicked.connect(self.open_update)
-        lv.addWidget(b5)
+        tl.addWidget(b5)
+        lv.addWidget(self.tools_box)
         body.addWidget(left)
 
         # 右: 工具列 + 清單
@@ -3171,6 +3276,9 @@ class Player(QWidget):
         QTreeWidget::item:hover:!selected {{ background-color: rgba(255,255,255,28); }}
         QHeaderView {{ background: transparent; border: none; }}
         QHeaderView::section {{ background-color: rgba(255,255,255,26); border: none; padding: 6px; color: {sub}; }}
+        QListWidget#folderlist QScrollBar:vertical {{ background: rgba(255,255,255,28); width: 16px; margin: 0; border-radius: 8px; }}
+        QListWidget#folderlist QScrollBar::handle:vertical {{ background: {acc}; border-radius: 8px; min-height: 36px; }}
+        QListWidget#folderlist QScrollBar::handle:vertical:disabled {{ background: rgba(255,255,255,45); }}
         QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
         QScrollBar::handle:vertical {{ background: rgba(255,255,255,70); border-radius: 5px; min-height: 30px; }}
         QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
@@ -3192,6 +3300,9 @@ class Player(QWidget):
         QPushButton#clockbtn[rep="1"] {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#shufbtn:checked {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#foldbtn {{ font-size: 18px; padding: 0; }}
+        QPushButton#drawerbar {{ background-color: rgba(255,255,255,22); border: none; border-radius: 6px; font-size: 13px; padding: 0; min-height: 0; }}
+        QPushButton#drawerbar:hover {{ background-color: {acc}; color: #ffffff; }}
+        QWidget#toolsbox {{ background: transparent; }}
         QPushButton#foldbtn[rep="1"] {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#repbtn[rep="1"], QPushButton#repbtn[rep="2"] {{ background-color: {acc}; color: #ffffff; }}
         QSlider::groove:vertical {{ width: 6px; background: rgba(255,255,255,50); border-radius: 3px; }}
@@ -3603,6 +3714,10 @@ class Player(QWidget):
         self.wx_now.setTextFormat(Qt.RichText)
         self.wx_range = QLabel("")
         self.wx_range.setWordWrap(True)
+        self._wx_pi = 0                       # 目前輪到第幾段預報
+        self._wx_rot = QTimer(self)
+        self._wx_rot.timeout.connect(self._wx_rotate)
+        self._wx_rot.start(5000)             # 每 5 秒換下一段
         self.wx_days = QLabel("")
         self.wx_days.setObjectName("sub")
         for w in (self.wx_place, self.wx_now, self.wx_range, self.wx_days):
@@ -3645,6 +3760,11 @@ class Player(QWidget):
         for cb, key in ((self.cb_hour, "chime_hour"), (self.cb_half, "chime_half"), (self.cb_ampm, "chime_ampm")):
             cb.toggled.connect(lambda on, k=key: self.cfg.__setitem__(k, on))
             v.addWidget(cb)
+        self.cb_daily = QCheckBox("7點/12點/19點 報天氣與降雨機率")
+        self.cb_daily.setToolTip("每天早上7點、中午12點、晚上7點，報時間後接著報氣溫、天氣狀況、降雨機率。需要先在「☁ 天氣設定」選好地區；就算「整點報時」沒勾也會報。")
+        self.cb_daily.setChecked(self.cfg["wx_daily"])
+        self.cb_daily.toggled.connect(lambda on: self.cfg.__setitem__("wx_daily", on))
+        v.addWidget(self.cb_daily)
         self.cb_wx = QCheckBox("報時時一併報氣溫")
         self.cb_wx.setChecked(self.cfg["chime_weather"])
         self.cb_wx.toggled.connect(lambda on: self.cfg.__setitem__("chime_weather", on))
@@ -3820,8 +3940,9 @@ class Player(QWidget):
         key = (dt.hour, dt.minute)
         if dt.minute in (0, 30) and key != self._last_chime:
             self._last_chime = key
-            if (dt.minute == 0 and self.cfg["chime_hour"]) or (dt.minute == 30 and self.cfg["chime_half"]):
-                self._announce()
+            daily = bool(self.cfg["wx_daily"]) and dt.minute == 0 and dt.hour in (7, 12, 19)
+            if daily or (dt.minute == 0 and self.cfg["chime_hour"]) or (dt.minute == 30 and self.cfg["chime_half"]):
+                self._announce(daily=daily)
 
     def _time_text(self, dt):
         h12 = dt.hour % 12 or 12
@@ -3835,7 +3956,7 @@ class Player(QWidget):
             return f"現在是{pre}{h12}點半"
         return f"現在是{pre}{h12}點{dt.minute}分"        # 只有「試聽」會走到這裡
 
-    def _announce(self, test=False):
+    def _announce(self, test=False, daily=False):
         if self._speaking:
             return
         self._speaking = True
@@ -3844,13 +3965,15 @@ class Player(QWidget):
             pygame.mixer.music.set_volume(self.cfg["volume"] / 100 * 0.25)
         except Exception:
             pass
-        text = self._time_text(datetime.datetime.now()) + self._weather_phrase()
+        text = self._time_text(datetime.datetime.now()) + self._weather_phrase(full=daily)
         note = ""
-        if self.cfg["chime_weather"] and not self._weather_phrase():
+        if (self.cfg["chime_weather"] or daily) and not self._weather_phrase(full=daily):
             if not (self.cfg["weather_name"] or "").strip():
                 note = "\n(還沒設定地區名稱，所以只報時間)" if self._has_place() else "\n(還沒設定地區，所以只報時間；可按「☁ 天氣設定」)"
             elif not self.weather:
                 note = "\n(天氣還沒讀到，這次只報時間)"
+            else:
+                note = "\n(氣象資料太舊，這次只報時間)"
         self.speak_lbl.setText("播報: " + text + note)
         self.speaker.speak(text, self.cfg.get("voice", ""), int(self.cfg.get("voice_rate", 0)))
 
@@ -3928,32 +4051,65 @@ class Player(QWidget):
             self.wx_days.setText("")
             return
 
-        def deg(x):
-            return "?" if x is None else f"{round(x)}°"
-        d0 = wx["days"][0]
         t = wx.get("temp")
+        warn = ""
+        dts = wx.get("data_ts")
+        if dts and time.time() - dts > 90 * 60:           # 倉庫那邊的資料超過 1.5 小時沒更新: 直接標出資料時間，不要讓人以為是即時的
+            warn = f"<br><span style='font-size:12px; font-weight:normal'>⚠ 資料時間 {datetime.datetime.fromtimestamp(dts).strftime('%m/%d %H:%M')} (較舊)</span>"
         self.wx_now.setText(f"{wx_icon(wx.get('code'))} {('?' if t is None else round(t))}°C"
-                            f"<br><span style='font-size:13px; font-weight:normal'>{wx.get('text') or wx_text(wx.get('code'))}</span>")
-        rng = f"今天 {deg(d0['tmin'])} ~ {deg(d0['tmax'])}"
-        if d0.get("pop") is not None:
-            rng += f"　降雨機率 {round(d0['pop'])}%"
-        self.wx_range.setText(rng)
-        names = ("今天", "明天", "後天")
-        self.wx_days.setText("\n".join(
-            f"{names[i]} {deg(d['tmin'])}~{deg(d['tmax'])}　{wx_icon(d['code'])} {d.get('text') or wx_text(d['code'])}"
-            for i, d in enumerate(wx["days"][1:3], start=1)))
+                            f"<br><span style='font-size:13px; font-weight:normal'>{wx.get('text') or wx_text(wx.get('code'))}</span>" + warn)
+        self._wx_pi = 0
+        self._render_wx_range()
+        if wx.get("periods"):
+            self.wx_days.setText("")                       # 時段已經包含明天，不重複顯示
+        else:
+            names = ("今天", "明天", "後天")
+            self.wx_days.setText("\n".join(
+                f"{names[i]} {_deg(d['tmin'])}~{_deg(d['tmax'])}　{wx_icon(d['code'])} {d.get('text') or wx_text(d['code'])}"
+                for i, d in enumerate(wx["days"][1:3], start=1)))
+
+    def _render_wx_range(self):
+        wx = self.weather
+        items = wx_items(wx) if wx else []
+        if not items:
+            return
+        i = self._wx_pi % len(items)
+        it = items[i]
+        line = f"{it['label']}　{wx_icon(it.get('code'))} {it.get('text') or wx_text(it.get('code'))}\n{_deg(it.get('tmin'))} ~ {_deg(it.get('tmax'))}"
+        if it.get("pop") is not None:
+            line += f"　降雨機率 {round(it['pop'])}%"
+        if len(items) > 1:
+            line += "　" + "".join("●" if k == i else "○" for k in range(len(items)))
+        self.wx_range.setText(line)
+
+    def _wx_rotate(self):
+        if self.weather and self._has_place():
+            self._wx_pi += 1
+            self._render_wx_range()
 
     @staticmethod
     def _deg_words(n):
         return f"零下{-n}度" if n < 0 else f"{n}度"
 
-    def _weather_phrase(self):
+    def _weather_phrase(self, full=False):
         """報時後面接的氣溫那一句，例如「，二崙鄉今天氣溫22度到28度」。沒設定地區、或沒讀到天氣就回傳空字串。"""
-        if not self.cfg["chime_weather"]:
+        if not (self.cfg["chime_weather"] or full):
             return ""
         wx, name = self.weather, (self.cfg["weather_name"] or "").strip()
         if not wx or not name or time.time() - wx["ts"] > 7200:
             return ""
+        if wx.get("data_ts") and time.time() - wx["data_ts"] > 6 * 3600:      # 倉庫資料超過 6 小時沒更新，不報以免報到舊資料
+            return ""
+        if full:
+            its = wx_items(wx)
+            p = its[0] if its else None
+            if p and wx.get("periods") and p.get("tmin") is not None and p.get("tmax") is not None:
+                lo, hi = round(p["tmin"]), round(p["tmax"])
+                rng = self._deg_words(hi) if lo == hi else f"{self._deg_words(lo)}到{self._deg_words(hi)}"
+                s = f"，{name}{p['label']}氣溫{rng}，{p.get('text') or wx_text(p.get('code'))}"
+                if p.get("pop") is not None:
+                    s += f"，降雨機率百分之{round(p['pop'])}"
+                return s
         d = wx["days"][0]
         if d["tmin"] is not None and d["tmax"] is not None:
             lo, hi = round(d["tmin"]), round(d["tmax"])
@@ -3963,11 +4119,45 @@ class Player(QWidget):
         else:
             return ""
         s = f"，{name}今天氣溫{rng}"
-        if self.cfg["chime_weather_extra"]:
+        if full or self.cfg["chime_weather_extra"]:
             s += f"，{d.get('text') or wx_text(d['code'])}"
-            if d.get("pop") is not None and d["pop"] >= 20:
+            if d.get("pop") is not None and (full or d["pop"] >= 20):       # 每天固定報天氣時，降雨機率一定要報 (0% 也報)
                 s += f"，降雨機率百分之{round(d['pop'])}"
         return s
+
+    def _toggle_tools(self):
+        self.cfg["tools_open"] = not self.cfg["tools_open"]
+        save_cfg(self.cfg)
+        self._apply_tools(animate=True)
+
+    def _apply_tools(self, animate=False):
+        on = bool(self.cfg["tools_open"])
+        box = self.tools_box
+        self.tools_bar.setText("▼" if on else "▲")
+        self.tools_bar.setToolTip("收起下面的按鈕，讓資料夾清單變高" if on else "展開下面的按鈕")
+        a = getattr(self, "_tools_anim", None)
+        if a is not None:
+            a.stop()
+        if not animate:
+            box.setMaximumHeight(16777215 if on else 0)
+            box.setVisible(on)
+            return
+        full = max(box.layout().sizeHint().height(), 1)
+        self._tools_anim = a = QVariantAnimation(self)
+        a.setDuration(220)
+        a.setEasingCurve(QEasingCurve.OutCubic)
+        a.valueChanged.connect(lambda v: box.setMaximumHeight(int(v)))
+        if on:
+            box.setMaximumHeight(0)
+            box.setVisible(True)
+            a.setStartValue(0)
+            a.setEndValue(full)
+            a.finished.connect(lambda: box.setMaximumHeight(16777215))
+        else:
+            a.setStartValue(box.height())
+            a.setEndValue(0)
+            a.finished.connect(lambda: box.setVisible(False))
+        a.start()
 
     def _toggle_folders(self):
         self.cfg["folders_open"] = not self.cfg["folders_open"]
