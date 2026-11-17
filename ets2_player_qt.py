@@ -6,7 +6,7 @@
 不會修改、搬動你的任何音樂檔。"""
 import ast, ctypes, datetime, hashlib, importlib, importlib.util, io, json, os, random, re, shutil, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, zipfile
 
-VERSION = 14     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 15     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
 UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
@@ -319,6 +319,7 @@ def load_cfg():
         c["wp_mode"] = WP_MODES[1]
     c.setdefault("wp_shuffle", False)      # 隨機換圖
     c.setdefault("wp_fade", True)          # 淡入淡出
+    c.setdefault("dl_ack", False)          # 第一次開下載功能時，是否已按過「繼續」(進階功能警告)
     c.setdefault("dl_dir", "")             # 下載位置
     c.setdefault("dl_br", "192")
     c.setdefault("dl_seg", "8")
@@ -2397,7 +2398,14 @@ def fetch_weather_cwa(lat, lon):
     d0 = days[0]
     return {"ts": time.time(), "temp": best.get("temp"), "code": best.get("code") if best.get("wx") else d0.get("code"),
             "text": best.get("wx") or d0.get("text"), "days": days, "src": "cwa",
-            "place": f"{best['c']}{best.get('t', '')}", "updated": d.get("updated", "")}
+            "place": (best["c"] + best.get("t", "")) if bd <= 5 else best["c"], "updated": d.get("updated", "")}
+
+
+_PLACE_SUF = ("區", "鄉", "鎮", "市", "縣")
+
+
+def _strip_suf(t):
+    return t[:-1] if len(t) >= 3 and t[-1] in _PLACE_SUF else t
 
 
 def geocode_cwa(name):
@@ -2405,12 +2413,14 @@ def geocode_cwa(name):
     q = _norm_place(name)
     if not q:
         return []
+    qs = _strip_suf(q)
     seen, out = set(), []
     for st in d["stations"]:
         key = (st["c"], st.get("t", ""))
         town = _norm_place(st.get("t", ""))
         cty = _norm_place(st["c"])
-        hit = q in town or q in cty or q in _norm_place(st["n"]) or (town and town in q) or (q.startswith(cty) and q[len(cty):] in town)
+        hit = (q in town or q in cty or q in _norm_place(st["n"]) or (town and town in q) or (q.startswith(cty) and q[len(cty):] in town)
+               or (qs != q and (qs in town or qs in cty or qs in _norm_place(st["n"]))))
         if hit and key not in seen:
             seen.add(key)
             out.append({"name": st.get("t") or st["c"], "admin": st["c"], "country": "台灣", "lat": st["la"], "lon": st["lo"]})
@@ -2426,12 +2436,23 @@ def geocode(name):
         err = str(e)
     if local:
         return local
-    try:
-        return geocode_openmeteo(name)
-    except Exception as e:
+    tries = [name.strip()]
+    s2 = _strip_suf(_norm_place(name))
+    if s2 and s2 not in tries:
+        tries.append(s2)
+    last = None
+    for t in tries:
+        try:
+            r = geocode_openmeteo(t)
+            if r:
+                return r
+        except Exception as e:
+            last = e
+    if last is not None:
         if err:
-            raise RuntimeError(f"氣象資料讀取失敗 ({err})；備援查詢也失敗 ({e})")
-        raise
+            raise RuntimeError(f"氣象資料讀取失敗 ({err})；備援查詢也失敗 ({last})")
+        raise last
+    return []
 
 
 def fetch_weather(lat, lon):
@@ -2590,10 +2611,10 @@ class WeatherDialog(QDialog):
                 self.status.setText("⚠️ " + val)
                 return
             lat, lon = val
+            self.pl.cfg["weather_name"] = ""
+            self.name.setText("")
             self._set_place(None, lat, lon)
-            self.status.setText("✅ 已定位。Windows 只提供座標、不提供地名，請在下方確認「報時時唸的地區名稱」。")
-            if not self.name.text().strip():
-                self.name.setFocus()
+            self.status.setText("✅ 已定位，正在取得地區名稱。Windows 只提供座標，名稱取自附近的氣象站 (台灣以外要自己填)；不對可以直接改下方「報時時唸的地區名稱」。")
 
     def choose(self):
         it = self.results.currentItem()
@@ -3134,6 +3155,10 @@ class Player(QWidget):
         QLineEdit, QComboBox {{ background-color: rgba(0,0,0,70); border: 1px solid rgba(255,255,255,40); border-radius: 8px; padding: 5px 8px; }}
         QComboBox::drop-down {{ border: none; width: 22px; }}
         QComboBox QAbstractItemView {{ background-color: rgb({min(255,r+25)},{min(255,g+25)},{min(255,b+25)}); selection-background-color: {acc}; border: 1px solid rgba(255,255,255,50); color: {txt}; }}
+        QMenu {{ background-color: rgb({min(255,r+25)},{min(255,g+25)},{min(255,b+25)}); border: 1px solid rgba(255,255,255,60); padding: 4px; }}
+        QMenu::item {{ background: transparent; color: {txt}; padding: 7px 24px; border-radius: 6px; }}
+        QMenu::item:selected {{ background-color: {acc}; color: #ffffff; }}
+        QMenu::separator {{ height: 1px; background: rgba(255,255,255,50); margin: 4px 8px; }}
         QCheckBox {{ background: transparent; spacing: 8px; }}
         QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid {sub}; background: rgba(0,0,0,60); }}
         QCheckBox::indicator:checked {{ background: {acc}; border-color: {acc}; }}
@@ -3372,6 +3397,16 @@ class Player(QWidget):
 
     # ---------------- 下載音樂 ----------------
     def open_download(self):
+        if not self.cfg.get("dl_ack"):
+            ok = QMessageBox.question(
+                self, "下載音樂 (進階功能)",
+                "這是進階功能，不保證在每一台電腦都能用 (需要另外下載 yt-dlp 和 ffmpeg，可能被防毒或網路擋住)。\n\n"
+                "下載內容是否符合網站規定與著作權，請自行判斷，使用上的後果由使用者自己負責。\n\n"
+                "要繼續嗎？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+            if not ok:
+                return
+            self.cfg["dl_ack"] = True
+            save_cfg(self.cfg)
         if self._dl_dlg is None:
             self._dl_dlg = DownloadDialog(self)
         self._dl_dlg.show()
@@ -3861,6 +3896,11 @@ class Player(QWidget):
         kind, val = out
         if kind == "ok":
             self.weather, self._wx_err = val, ""
+            if not (self.cfg["weather_name"] or "").strip() and val.get("place"):      # 自動定位後名稱是空的: 用氣象站的縣市/鄉鎮補上
+                self.cfg["weather_name"] = val["place"]
+                save_cfg(self.cfg)
+                if self._wx_dlg is not None:
+                    self._wx_dlg.name.setText(val["place"])
             self._wx_next = time.time() + 1800          # 每 30 分鐘更新一次
         else:
             self._wx_err = val
