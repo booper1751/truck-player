@@ -2,8 +2,13 @@ name: 更新氣象資料
 
 on:
   schedule:
-    - cron: "7,37 * * * *"      # 每小時的 07 分和 37 分 (GitHub 有時會晚幾分鐘才跑)
+    - cron: "12,42 * * * *"     # 每小時的 12 分和 42 分 (GitHub 有時會晚幾分鐘才跑)
   workflow_dispatch:             # 也可以在 Actions 分頁按「Run workflow」手動跑一次
+  push:                          # 上傳新版抓取程式或這個設定檔時，也會立刻跑一次
+    branches: [main]
+    paths:
+      - "weather/**"
+      - ".github/workflows/weather.yml"
 
 permissions:
   contents: write
