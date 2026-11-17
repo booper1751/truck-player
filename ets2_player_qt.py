@@ -1,130 +1,24 @@
 # -*- coding: utf-8 -*-
 """卡車播放器 (Qt 版)  —  勾選資料夾 + 播放清單 + 播放次數排行榜 + 桌布背景(面板半透明)
-.py 執行: 第一次會自動安裝 PySide6 (介面)、pygame (播放)、mutagen、keyboard (全域快捷鍵，可選)
-EXE 執行: 套件已包在裡面。第一次執行會自動安裝到 %LOCALAPPDATA%\\TruckPlayer、在桌面建立捷徑；
-          最小化時收進系統匣；更新走 GitHub Releases。
+第一次執行會自動安裝: PySide6 (介面)、pygame (播放)、keyboard (全域快捷鍵，可選)
 全域快捷鍵: F9 上一首 / F10 播放暫停 / F11 下一首
 資料: 同資料夾的 player_config.json 與 player_stats.db (與舊 Tk 版共用，次數會保留)
 不會修改、搬動你的任何音樂檔。"""
-import ast, ctypes, datetime, hashlib, importlib, importlib.util, json, os, random, re, shutil, sqlite3, subprocess, sys, threading, time, urllib.error, urllib.request
+import ast, ctypes, datetime, hashlib, importlib, importlib.util, io, json, os, random, re, shutil, sqlite3, subprocess, sys, threading, time, urllib.parse, urllib.request, zipfile
 
-VERSION = 12     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
-UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # (.py 版) 只填「帳號/倉庫」時，預設去倉庫抓的檔名
+VERSION = 14     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
 UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
-RELEASE_ASSET = "TruckPlayer.exe"             # (EXE 版) Releases 裡要下載的檔名，要跟 build.yml 打包出來的檔名一致
 
-FROZEN = bool(getattr(sys, "frozen", False))  # True = 已打包成 EXE
-SCRIPT = sys.executable if FROZEN else os.path.abspath(__file__)
-HERE = os.path.dirname(SCRIPT)
-
-APP_NAME = "TruckPlayer"
-INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), APP_NAME)
-INSTALL_EXE = os.path.join(INSTALL_DIR, APP_NAME + ".exe")
-SHORTCUT_NAME = "卡車播放器.lnk"
-MIGRATE_FILES = ("player_config.json", "player_stats.db", "update_source.json")   # 第一次安裝時，順便帶過去 (如果 EXE 旁邊本來就有)
+FROZEN = bool(getattr(sys, "frozen", False))      # True = 打包成 EXE 後執行
+APP_NAME = "卡車播放器"
+EXE_NAME = "TruckPlayer.exe"
+INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "TruckPlayer")
+GITHUB_API = os.environ.get("TRUCK_GITHUB_API", "https://api.github.com")
+ASSET_NAME_HINT = ".exe"
 
 LAST_ERR = ""
-
-
-def message_box(text, title="卡車播放器"):
-    """Windows 原生訊息框 (不需要 Qt，打包成沒有黑視窗的 EXE 時也能用)"""
-    try:
-        if os.name == "nt":
-            ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
-        else:
-            print(title + ":", text)
-    except Exception:
-        pass
-
-
-def spawn_self(path=None):
-    """另外開一個獨立的新程式 (更新後重啟、首次安裝後開啟安裝好的那份)。
-    EXE 是「單檔版」時，子程式不能沿用舊的暫存解壓目錄，所以要清掉 PyInstaller 的環境變數。"""
-    if FROZEN:
-        env = os.environ.copy()
-        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
-        for k in [k for k in env if k.startswith("_PYI") or k == "_MEIPASS2"]:
-            env.pop(k, None)
-        flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0      # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen([path or SCRIPT], env=env, creationflags=flags, close_fds=True, cwd=os.path.dirname(path or SCRIPT))
-    else:
-        subprocess.Popen([sys.executable, SCRIPT])
-
-
-def desktop_dir():
-    try:
-        buf = ctypes.create_unicode_buffer(260)
-        if ctypes.windll.shell32.SHGetFolderPathW(0, 0x10, 0, 0, buf) == 0 and buf.value:     # CSIDL_DESKTOPDIRECTORY
-            return buf.value
-    except Exception:
-        pass
-    return os.path.join(os.path.expanduser("~"), "Desktop")
-
-
-def make_desktop_shortcut(target=INSTALL_EXE):
-    """在桌面建立捷徑 (用 Windows 內建 PowerShell，不需要任何套件)。成功回傳捷徑路徑，失敗回傳 None。"""
-    lnk = os.path.join(desktop_dir(), SHORTCUT_NAME)
-    if os.path.exists(lnk):
-        return lnk
-    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:TP_LNK);"
-          "$s.TargetPath=$env:TP_TARGET;$s.WorkingDirectory=$env:TP_DIR;$s.IconLocation=$env:TP_TARGET+',0';$s.Save()")
-    env = dict(os.environ, TP_LNK=lnk, TP_TARGET=target, TP_DIR=os.path.dirname(target))
-    try:
-        subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], env=env,
-                       creationflags=0x08000000 if os.name == "nt" else 0, capture_output=True, timeout=30)
-    except Exception:
-        return None
-    return lnk if os.path.exists(lnk) else None
-
-
-def maybe_install():
-    """EXE 第一次執行 (不在安裝資料夾裡) 時: 建資料夾 → 把自己複製進去 → 桌面建捷徑 → 開啟安裝好的那份 → 結束這一份。
-    已經安裝過了就不覆蓋 (版本由程式內的自動更新處理)。複製失敗時，就直接在原地執行。"""
-    if os.path.normcase(os.path.abspath(HERE)) == os.path.normcase(os.path.abspath(INSTALL_DIR)):
-        return
-    fresh = not os.path.exists(INSTALL_EXE)
-    try:
-        os.makedirs(INSTALL_DIR, exist_ok=True)
-        if fresh:
-            tmp = INSTALL_EXE + ".tmp"
-            shutil.copy2(SCRIPT, tmp)
-            os.replace(tmp, INSTALL_EXE)
-            for fn in MIGRATE_FILES:
-                src, dst = os.path.join(HERE, fn), os.path.join(INSTALL_DIR, fn)
-                if os.path.exists(src) and not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-    except OSError as e:
-        message_box(f"無法安裝到:\n{INSTALL_DIR}\n\n原因: {e}\n\n這次會直接在目前的位置執行。")
-        return
-    lnk = make_desktop_shortcut()
-    try:
-        spawn_self(INSTALL_EXE)
-    except Exception as e:
-        message_box(f"安裝好了，但無法自動開啟:\n{INSTALL_EXE}\n\n原因: {e}")
-        sys.exit(0)
-    if fresh:
-        msg = f"已安裝到:\n{INSTALL_DIR}\n\n" + ("桌面已建立「卡車播放器」捷徑，之後請從桌面開啟。" if lnk else "桌面捷徑建立失敗，請到上面的資料夾直接開啟。")
-        message_box(msg + "\n\n你下載的這個檔案已經用不到，可以刪除。")
-    sys.exit(0)
-
-
-def cleanup_old_files():
-    """清掉上次更新留下的舊檔 (.old / .new)；刪不掉就留著，下次再試"""
-    base = os.path.basename(SCRIPT)
-    try:
-        for fn in os.listdir(HERE):
-            if fn.startswith(base + ".old") or fn == base + ".new":
-                try:
-                    os.remove(os.path.join(HERE, fn))
-                except OSError:
-                    pass
-    except OSError:
-        pass
-
-
-if FROZEN and os.name == "nt" and "--no-install" not in sys.argv:
-    maybe_install()
 
 
 def _pip(pkg):
@@ -151,38 +45,40 @@ def ensure_deps():
     if importlib.util.find_spec("keyboard") is None:
         print("正在下載安裝 keyboard ...")
         _pip("keyboard")
+    if importlib.util.find_spec("edge_tts") is None:
+        print("正在下載安裝 edge-tts (線上女聲，可選) ...")
+        _pip("edge-tts")
     importlib.invalidate_caches()
     print("Python 版本:", sys.version.split()[0])
 
 
 if not FROZEN:
-    ensure_deps()
+    ensure_deps()      # EXE 版已經把套件都包好了，不需要再安裝
 try:
-    from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, QVariantAnimation, Signal
-    from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QIntValidator, QImage, QPainter, QPixmap, QPolygonF, QRadialGradient,
-                               QLinearGradient, QBrush)
-    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer, QVariantAnimation, Signal
+    from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImageReader, QIntValidator, QImage, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient, QLinearGradient, QBrush
     from PySide6.QtWidgets import (QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                                   QLineEdit, QListWidget, QListWidgetItem, QMenu, QPushButton, QSizeGrip, QSlider, QSystemTrayIcon,
-                                   QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView, QMessageBox, QStyle, QProgressBar, QGraphicsDropShadowEffect)
+                                   QLineEdit, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSizeGrip, QSlider,
+                                   QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView, QMessageBox, QStyle, QProgressBar, QGraphicsDropShadowEffect, QMenu, QSystemTrayIcon)
 except ImportError as e:
     print("PySide6 安裝失敗:", e, "\n", LAST_ERR)
-    if FROZEN:
-        message_box(f"程式缺少必要元件，無法啟動:\n{e}")
-    else:
-        input("按 Enter 結束")
+    input("按 Enter 結束")
     sys.exit(1)
 try:
     import pygame
 except ImportError:
     pygame = None
 
+SCRIPT = os.path.abspath(sys.executable if FROZEN else __file__)     # EXE 版: 這個 EXE 本身
+HERE = os.path.dirname(SCRIPT)
 CFG = os.path.join(HERE, "player_config.json")
 DB = os.path.join(HERE, "player_stats.db")
 EXTS = (".mp3", ".flac", ".wav", ".ogg", ".m4a")
 COUNT_AFTER_S = 30
 SKIP_BEFORE_S = 10
 COLD_SORT = "冷門榜(次數少→多)"
+WP_MODES = ["每首歌換一張", "每 30 分鐘換一張", "每 1 小時換一張", "不換 (維持目前這張)"]
+WP_INTERVAL = {"每 30 分鐘換一張": 1800, "每 1 小時換一張": 3600}
 SORTS = ["常聽榜", "近期熱門(30天)", "最近播放", "從沒聽過", "跳過最多", COLD_SORT, "資料夾順序"]
 
 # tint = 面板底色(RGB)；text = 文字色；accent = 強調色；base = 沒有桌布時的背景色
@@ -196,52 +92,168 @@ THEMES = {
 }
 
 
-# ---------------- 圖示 (播放鍵，用程式畫出來，不需要圖檔) ----------------
-# 設計 (和 make_icon.py 產生 EXE 檔案圖示 icon.ico 的數字一致): 藍紫圓角方塊 + 白色播放三角形
-ICON_BG = "#5865f2"
-ICON_RADIUS = 0.22
-ICON_TRI = ((0.36, 0.25), (0.36, 0.75), (0.76, 0.50))
-
-
-def play_pixmap(size):
+# ---------------- 圖示 (播放鍵) ----------------
+def draw_icon_pixmap(size):
+    """程式自己畫的圖示: 圓角深色底 + 紫色漸層圓 + 白色播放鍵。視窗、工作列、系統匣、EXE 檔案圖示都用它。"""
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
+    s = float(size)
     p.setPen(Qt.NoPen)
-    p.setBrush(QColor(ICON_BG))
-    p.drawRoundedRect(QRectF(0, 0, size, size), size * ICON_RADIUS, size * ICON_RADIUS)
-    p.setBrush(QColor("#ffffff"))
-    p.drawPolygon(QPolygonF([QPointF(x * size, y * size) for x, y in ICON_TRI]))
+    bg = QLinearGradient(0, 0, 0, s)
+    bg.setColorAt(0, QColor(54, 56, 66))
+    bg.setColorAt(1, QColor(24, 25, 30))
+    p.setBrush(QBrush(bg))
+    p.drawRoundedRect(QRect(0, 0, size, size), s * 0.22, s * 0.22)
+    g = QLinearGradient(s * 0.2, s * 0.15, s * 0.8, s * 0.85)
+    g.setColorAt(0, QColor(139, 108, 255))
+    g.setColorAt(1, QColor(88, 101, 242))
+    p.setBrush(QBrush(g))
+    m = s * 0.16
+    p.drawEllipse(QRect(int(m), int(m), int(s - 2 * m), int(s - 2 * m)))
+    p.setBrush(QColor(255, 255, 255))
+    cx, cy, h = s * 0.5, s * 0.5, s * 0.17
+    p.drawPolygon(QPolygonF([QPointF(cx - h * 0.62, cy - h), QPointF(cx - h * 0.62, cy + h), QPointF(cx + h * 1.1, cy)]))
     p.end()
     return pm
 
 
 def app_icon():
     ic = QIcon()
-    for s in (16, 24, 32, 48, 64, 128, 256):
-        ic.addPixmap(play_pixmap(s))
+    for n in (16, 24, 32, 48, 64, 128, 256):
+        ic.addPixmap(draw_icon_pixmap(n))
     return ic
 
 
-# ---------------- 單一執行個體 (已經開著就把它叫出來，不要開第二個) ----------------
-SINGLE_NAME = "TruckPlayer.SingleInstance"
+# ---------------- EXE 自我安裝 (資料夾 + 桌面捷徑) ----------------
+def _ps_quote(t):
+    return "'" + str(t).replace("'", "''") + "'"
 
 
-def single_instance():
-    """回傳 QLocalServer (這是第一個執行個體)；回傳 None 代表已經有一個在跑，已通知它顯示視窗，這個應該直接結束"""
-    sock = QLocalSocket()
-    sock.connectToServer(SINGLE_NAME)
-    if sock.waitForConnected(300):
-        sock.write(b"show")
-        sock.flush()
-        sock.waitForBytesWritten(300)
-        sock.disconnectFromServer()
-        return None
-    QLocalServer.removeServer(SINGLE_NAME)          # 清掉上次異常結束留下的殘骸
-    srv = QLocalServer()
-    srv.listen(SINGLE_NAME)
-    return srv
+def shortcut_script(target, workdir, name=APP_NAME):
+    """產生 PowerShell 指令: 在桌面與開始功能表各建一個捷徑 (桌面位置被 OneDrive 搬走也能抓對)。"""
+    return (
+        "$ErrorActionPreference='Stop';"
+        "$w=New-Object -ComObject WScript.Shell;"
+        f"foreach($d in @([Environment]::GetFolderPath('Desktop'),[Environment]::GetFolderPath('Programs'))){{"
+        f"if(-not $d){{continue}};"
+        f"$s=$w.CreateShortcut((Join-Path $d ({_ps_quote(name)}+'.lnk')));"
+        f"$s.TargetPath={_ps_quote(target)};$s.WorkingDirectory={_ps_quote(workdir)};"
+        f"$s.IconLocation=({_ps_quote(target)}+',0');$s.Description={_ps_quote(name)};$s.Save()}}"
+    )
+
+
+def make_shortcuts(target, workdir):
+    import base64
+    enc = base64.b64encode(shortcut_script(target, workdir).encode("utf-16-le")).decode()
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", enc],
+                       capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "PowerShell 失敗").strip()[-300:])
+
+
+def spawn_clean(exe, args=()):
+    """啟動另一個 EXE。PyInstaller 單檔版要清掉環境標記，新程式才會自己重新解壓縮，不會誤用舊的暫存資料夾。"""
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    for k in [k for k in env if k.startswith("_PYI") or k == "_MEIPASS2"]:
+        env.pop(k, None)
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([exe, *args], env=env, cwd=os.path.dirname(exe), close_fds=True, creationflags=flags)
+
+
+def swap_file(new_path, target):
+    """把 new_path 換成 target。Windows 不能覆蓋執行中的 EXE，但可以改名: 舊的先改成 .old，新的放到原名。失敗會還原。"""
+    old = target + ".old"
+    had = os.path.exists(target)
+    if os.path.exists(old):
+        try:
+            os.remove(old)
+        except OSError:
+            os.replace(old, old + str(int(time.time())))
+    if had:
+        os.replace(target, old)
+    try:
+        os.replace(new_path, target)
+    except Exception:
+        if had:
+            os.replace(old, target)
+        raise
+
+
+def cleanup_old():
+    """啟動時順手刪掉上一次更新留下的 .old。"""
+    if not FROZEN:
+        return
+    try:
+        for n in os.listdir(HERE):
+            if n.startswith(EXE_NAME) and (n.endswith(".old") or ".old" in n or n.endswith(".new")):
+                try:
+                    os.remove(os.path.join(HERE, n))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def _flag(d, name):
+    return os.path.exists(os.path.join(d, name))
+
+
+def _write_flag(d, name):
+    try:
+        with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+            f.write("1")
+    except OSError:
+        pass
+
+
+def install_self_if_needed():
+    """EXE 第一次執行時詢問: 安裝到預設資料夾 / 自己選資料夾 / 不安裝直接在原地執行。
+    選過之後 (資料夾裡會有標記檔) 就不會再問。回傳 True 表示已改由新位置啟動，這個行程要結束。"""
+    if not FROZEN or os.environ.get("TRUCKPLAYER_NOINSTALL"):
+        return False
+    if _flag(HERE, "installed.flag") or _flag(HERE, "no_install.flag"):
+        return False
+    if os.path.normcase(os.path.abspath(HERE)) == os.path.normcase(os.path.abspath(INSTALL_DIR)):
+        return False
+    box = QMessageBox(QMessageBox.Question, APP_NAME, f"要把「{APP_NAME}」安裝起來嗎？\n\n"
+                      f"・預設位置: {INSTALL_DIR}\n・也可以自己選資料夾 (例如 D 槽)\n"
+                      "・會在桌面與開始功能表放上捷徑，之後更新會自動更新那一份\n・不會動你的任何音樂檔")
+    b_def = box.addButton("安裝到預設位置", QMessageBox.AcceptRole)
+    b_pick = box.addButton("選擇其他資料夾…", QMessageBox.AcceptRole)
+    b_here = box.addButton("不安裝，就在目前這個資料夾執行", QMessageBox.RejectRole)
+    box.setWindowIcon(app_icon())
+    box.exec()
+    clicked = box.clickedButton()
+    if clicked is b_here:
+        _write_flag(HERE, "no_install.flag")        # 之後不再詢問；設定檔、資料都放在這個 EXE 旁邊
+        return False
+    dest = INSTALL_DIR
+    if clicked is b_pick:
+        d = QFileDialog.getExistingDirectory(None, "選擇要安裝到哪個資料夾 (會在裡面建立 TruckPlayer 資料夾)")
+        if not d:
+            return False                              # 取消: 這次直接執行，下次再問
+        dest = os.path.join(os.path.normpath(d), "TruckPlayer")
+    elif clicked is not b_def:
+        return False
+    target = os.path.join(dest, EXE_NAME)
+    try:
+        os.makedirs(dest, exist_ok=True)
+        tmp = target + ".new"
+        shutil.copy2(SCRIPT, tmp)
+        swap_file(tmp, target)
+        _write_flag(dest, "installed.flag")
+        try:
+            make_shortcuts(target, dest)
+        except Exception as e:
+            QMessageBox.warning(None, APP_NAME, f"程式已安裝，但桌面捷徑沒建成功:\n{e}\n\n可以到 {dest} 自己對 {EXE_NAME} 按右鍵建立捷徑。")
+        spawn_clean(target)
+        return True
+    except Exception as e:
+        QMessageBox.critical(None, APP_NAME, f"安裝失敗，改為直接執行:\n{e}")
+        return False
 
 
 # ---------------- 資料庫 ----------------
@@ -298,6 +310,20 @@ def load_cfg():
     c.setdefault("panel_alpha", 45)        # 面板深度 0~100 (越小越透明，桌布越明顯)
     c.setdefault("wallpaper", "")
     c.setdefault("frameless", False)
+    c.setdefault("wp_slide", False)        # 桌布幻燈片是否啟用
+    c.setdefault("wp_dir", "")             # 幻燈片圖片資料夾
+    c.setdefault("wp_source", "folder")    # 圖片來源: folder=整個資料夾 / picked=自己一張一張挑
+    c.setdefault("wp_files", [])           # 自己挑的圖片 (依序)
+    c.setdefault("wp_mode", WP_MODES[1])   # 換圖時機
+    if c["wp_mode"] not in WP_MODES:
+        c["wp_mode"] = WP_MODES[1]
+    c.setdefault("wp_shuffle", False)      # 隨機換圖
+    c.setdefault("wp_fade", True)          # 淡入淡出
+    c.setdefault("dl_dir", "")             # 下載位置
+    c.setdefault("dl_br", "192")
+    c.setdefault("dl_seg", "8")
+    c.setdefault("dl_playlist", True)
+    c.setdefault("dl_aria2", True)
     c.setdefault("shuffle", False)         # 亂跳(隨機)模式是否開啟
     c.setdefault("update_src", "")         # 更新來源: GitHub 檔案網址 或 帳號/倉庫
     c.setdefault("update_auto", True)      # 啟動時自動檢查更新
@@ -306,9 +332,17 @@ def load_cfg():
     c.setdefault("drawer_open", False)     # 右側「定時/報時」抽屜是否展開
     c.setdefault("chime_hour", True)       # 整點報時
     c.setdefault("chime_half", True)       # 半點報時
-    c.setdefault("chime_ampm", False)      # 報時加上「上午/下午」
+    c.setdefault("chime_ampm", True)       # 報時加上「上午/下午」
+    c.setdefault("weather_name", "")       # 報時時唸的地區名稱
+    c.setdefault("weather_lat", None)      # 天氣地點座標
+    c.setdefault("weather_lon", None)
+    c.setdefault("chime_weather", True)    # 報時時一併報氣溫
+    c.setdefault("chime_weather_extra", False)   # 也報天氣狀況與降雨機率
+    c.setdefault("close_to_tray", False)   # 按 ✕ 時是否縮到系統匣
+    c.setdefault("tray_tip_shown", False)  # 第一次縮到系統匣時的說明氣泡是否已顯示
+    c.setdefault("voice", "")              # 報時女聲 (空白 = 自動)
+    c.setdefault("voice_rate", 0)          # 語速 -5 (慢) ~ +5 (快)
     c.setdefault("folders_open", True)     # 左側資料夾面板是否展開
-    c.setdefault("tray_min", True)         # 視窗最小化時收進系統匣 (右下角小圖示)
     c.setdefault("repeat", 0)              # 0=不循環 1=全部循環 2=單曲循環
     if c["repeat"] not in (0, 1, 2):
         c["repeat"] = 0
@@ -727,53 +761,8 @@ def file_update_src():
         return ""
 
 
-def bundled_repo():
-    """EXE 版: 打包時由 GitHub Actions 寫進 EXE 裡的 build_info.json {"repo": "帳號/倉庫"}，所以原始碼裡不會有帳號"""
-    try:
-        with open(os.path.join(getattr(sys, "_MEIPASS", HERE), "build_info.json"), encoding="utf-8") as f:
-            return str(json.load(f).get("repo", "")).strip()
-    except Exception:
-        return ""
-
-
 def default_src():
-    return UPDATE_SRC_DEFAULT.strip() or file_update_src() or (bundled_repo() if FROZEN else "")
-
-
-def parse_repo(text):
-    """從 「帳號/倉庫」 或任何 github.com / raw.githubusercontent.com 網址取出 帳號/倉庫 (EXE 版用)"""
-    t = re.sub(r"[?#].*$", "", (text or "").strip()).rstrip("/")
-    t = re.sub(r"^https?://", "", t)
-    t = re.sub(r"^(?:www\.)?(?:github\.com|raw\.githubusercontent\.com)/", "", t)
-    m = re.match(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?(?:/.*)?$", t)
-    return f"{m.group(1)}/{m.group(2)}" if m else None
-
-
-def check_release(src):
-    """EXE 版: 查倉庫最新 Release。回傳 dict: ok, version, url(EXE 下載網址), size 或 error"""
-    repo = parse_repo(src)
-    if not repo:
-        return {"ok": False, "error": "看不懂這個更新來源。請填「帳號/倉庫」。"}
-    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
-                                 headers={"User-Agent": "truck-player-updater", "Accept": "application/vnd.github+json"})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read(2 * 1024 * 1024).decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return {"ok": False, "error": "找不到已發布的版本 (Releases)。請確認倉庫是公開的，而且已經打包出第一個版本。"}
-        if e.code in (403, 429):
-            return {"ok": False, "error": "GitHub 暫時限制查詢次數，請稍後再試。"}
-        return {"ok": False, "error": f"連不上 GitHub (HTTP {e.code})。"}
-    except Exception as e:
-        return {"ok": False, "error": f"連不上 GitHub ({e})。請確認網路連線。"}
-    m = re.search(r"\d+", str(data.get("tag_name", "")))
-    if not m:
-        return {"ok": False, "error": "最新的 Release 沒有版本號 (標籤要像 v12)。"}
-    asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).lower() == RELEASE_ASSET.lower()), None)
-    if not asset or not asset.get("browser_download_url"):
-        return {"ok": False, "error": f"最新的 Release 裡找不到 {RELEASE_ASSET}。"}
-    return {"ok": True, "version": int(m.group()), "url": asset["browser_download_url"], "size": int(asset.get("size") or 0)}
+    return UPDATE_SRC_DEFAULT.strip() or file_update_src()
 
 
 def parse_update_source(text):
@@ -809,8 +798,40 @@ def read_version(text):
     return int(m.group(1)) if m else None
 
 
+def parse_repo(src):
+    """從任何寫法 (網址或 帳號/倉庫) 取出 (帳號, 倉庫)。"""
+    t = re.sub(r"[?#].*$", "", (src or "").strip()).rstrip("/")
+    t = re.sub(r"^https?://", "", t)
+    m = re.match(r"^raw\.githubusercontent\.com/([^/]+)/([^/]+)/", t)
+    if not m:
+        m = re.match(r"^(?:www\.)?github\.com/([^/]+)/([^/]+)", t)
+    if not m:
+        m = re.match(r"^([\w.-]+)/([\w.-]+?)(?:\.git)?$", t)
+    return (m.group(1), re.sub(r"\.git$", "", m.group(2))) if m else None
+
+
+def check_release(src):
+    """EXE 版: 去 GitHub Releases 查最新版 (版本號取自標籤，例如 v13 → 13)，回傳 exe 的下載網址。"""
+    rp = parse_repo(src)
+    if not rp:
+        return {"ok": False, "error": "沒有設定更新來源。"}
+    try:
+        req = urllib.request.Request(f"{GITHUB_API}/repos/{rp[0]}/{rp[1]}/releases/latest",
+                                     headers={"User-Agent": "truck-player-updater", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read(2 * 1024 * 1024).decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": f"連不上 GitHub 或還沒有發佈任何版本 ({e})"}
+    m = re.search(r"(\d+)", str(data.get("tag_name", "")))
+    asset = next((a for a in data.get("assets", []) if str(a.get("name", "")).lower().endswith(ASSET_NAME_HINT)), None)
+    if not m or not asset:
+        return {"ok": False, "error": "最新的發佈裡找不到版本號或 .exe 檔。"}
+    return {"ok": True, "version": int(m.group(1)), "url": asset["browser_download_url"], "exe": True,
+            "size": int(asset.get("size") or 0), "digest": str(asset.get("digest") or "")}
+
+
 def check_remote(src):
-    """回傳 dict: ok, version, text, url 或 error  (EXE 版改查 Releases，見 check_release)"""
+    """回傳 dict: ok, version, text, url 或 error"""
     if FROZEN:
         return check_release(src)
     urls = parse_update_source(src)
@@ -846,12 +867,11 @@ class UpdateDialog(QDialog):
         self.resize(640, 360)
         v = QVBoxLayout(self)
         v.addWidget(QLabel(f"目前版本：v{VERSION}"))
-        v.addWidget(QLabel("更新來源 (帳號/倉庫):" if FROZEN else "更新來源 (GitHub 檔案網址，或 帳號/倉庫):"))
+        v.addWidget(QLabel("更新來源 (GitHub 檔案網址，或 帳號/倉庫):"))
         self.src = QLineEdit(pl.cfg["update_src"] or default_src())
-        self.src.setPlaceholderText("例如 帳號/倉庫" if FROZEN else "例如 https://github.com/帳號/倉庫/blob/main/ets2_player_qt.py")
+        self.src.setPlaceholderText("例如 https://github.com/帳號/倉庫/blob/main/ets2_player_qt.py")
         v.addWidget(self.src)
-        hint = QLabel(f"會到這個倉庫的 Releases 找最新版的 {RELEASE_ASSET}。倉庫需要是公開的。" if FROZEN else
-                      f"只填「帳號/倉庫」時，會抓 main (或 master) 分支裡的 {UPDATE_DEFAULT_FILE}。倉庫需要是公開的。")
+        hint = QLabel(f"只填「帳號/倉庫」時，會抓 main (或 master) 分支裡的 {UPDATE_DEFAULT_FILE}。倉庫需要是公開的。")
         hint.setObjectName("sub")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -893,8 +913,8 @@ class UpdateDialog(QDialog):
         if not res["ok"]:
             self.status.setText("⚠ " + res["error"])
         elif res["version"] > VERSION:
-            self.status.setText(f"發現新版本 v{res['version']} (目前 v{VERSION})。\n按「下載並更新」會下載、換掉目前的程式檔，然後自動重新啟動。\n"
-                                ("舊版會暫時改名成 .old，重新開啟後自動清掉；" if FROZEN else "舊版會備份成同名的 .bak 檔；") + "設定、播放次數都不會變。")
+            self.status.setText(f"發現新版本 v{res['version']} (目前 v{VERSION})。\n按「下載並更新」會下載、換掉目前的程式檔，然後自動重新啟動。\n" +
+                                ("舊版會暫時改名保留；" if FROZEN else "舊版會備份成同名的 .bak 檔；") + "設定、播放次數都不會變。")
             self.go.setText(f"下載並更新到 v{res['version']}")
             self.go.show()
         elif res["version"] == VERSION:
@@ -973,23 +993,6 @@ def fetch_stream(url, cb, timeout=20):
     return bytes(buf).decode("utf-8")
 
 
-def fetch_file(url, dest, cb, timeout=30, limit=400 * 1024 * 1024):
-    """分段下載成檔案並回報進度 cb(已下載位元組, 總位元組或0)"""
-    req = urllib.request.Request(url, headers={"User-Agent": "truck-player-updater", "Cache-Control": "no-cache"})
-    got = 0
-    with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        while True:
-            chunk = r.read(65536)
-            if not chunk:
-                break
-            f.write(chunk)
-            got += len(chunk)
-            if got > limit:
-                raise ValueError("檔案異常大")
-            cb(got, total)
-
-
 class UpdateWorker(QObject):
     progress = Signal(int, str)        # (目標百分比, 目前步驟文字)
     done = Signal(bool, str)           # (成功與否, 訊息)
@@ -1001,51 +1004,11 @@ class UpdateWorker(QObject):
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
-    def _run_exe(self, res):
-        """EXE 版: 下載新 EXE → 驗證 → 把正在執行的舊 EXE 改名成 .old (Windows 允許改名但不允許覆蓋) → 新檔放到原本的名字"""
-        tmp = SCRIPT + ".new"
-        try:
-            self.progress.emit(2, "正在連線到 GitHub …")
-
-            def cb(got, total):
-                total = total or res.get("size") or 0
-                pct = 5 + int(75 * got / total) if total else 40
-                self.progress.emit(min(pct, 80), f"下載最新版 … {got / 1048576:.1f} MB" + (f" / {total / 1048576:.1f} MB" if total else ""))
-            fetch_file(res["url"], tmp, cb)
-            self.progress.emit(82, "檢查檔案是否完整 …")
-            with open(tmp, "rb") as f:
-                head = f.read(2)
-            if head != b"MZ" or (res.get("size") and os.path.getsize(tmp) != res["size"]):
-                raise ValueError("下載到的檔案不完整")
-            self.progress.emit(88, "備份目前的版本 …")
-            old = SCRIPT + ".old"
-            if os.path.exists(old):
-                try:
-                    os.remove(old)
-                except OSError:
-                    old = SCRIPT + f".old{int(time.time())}"      # 舊的 .old 刪不掉 (還被占用)，改用不重複的名字，下次啟動再清
-            os.replace(SCRIPT, old)
-            self.progress.emit(95, "安裝新版 …")
-            try:
-                os.replace(tmp, SCRIPT)
-            except OSError:
-                os.replace(old, SCRIPT)                           # 放不上去就把舊版改回來，保證程式還在
-                raise
-            self.progress.emit(100, "更新完成！")
-        finally:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-
     def _run(self):
         res = self.res
+        if res.get("exe"):
+            return self._run_exe(res)
         try:
-            if FROZEN:
-                self._run_exe(res)
-                self.done.emit(True, "")
-                return
             self.progress.emit(2, "正在連線到 GitHub …")
 
             def cb(got, total):
@@ -1067,6 +1030,47 @@ class UpdateWorker(QObject):
             self.done.emit(True, "")
         except Exception as e:
             self.done.emit(False, str(e))
+
+
+def _worker_run_exe(self, res):
+    """EXE 版更新: 下載新的 exe → 核對 → 舊的改名成 .old → 新的放到原名。失敗會還原，目前版本不受影響。"""
+    tmp = SCRIPT + ".new"
+    try:
+        self.progress.emit(2, "正在連線到 GitHub …")
+        req = urllib.request.Request(res["url"], headers={"User-Agent": "truck-player-updater"})
+        h = hashlib.sha256()
+        got = 0
+        with urllib.request.urlopen(req, timeout=30) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or res.get("size") or 0)
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                got += len(chunk)
+                pct = 5 + int(80 * got / total) if total else 40
+                self.progress.emit(min(pct, 85), f"下載最新版 … {got / 1048576:.1f} MB" + (f" / {total / 1048576:.1f} MB" if total else ""))
+        self.progress.emit(88, "檢查檔案是否完整 …")
+        with open(tmp, "rb") as f:
+            if f.read(2) != b"MZ" or got < 1_000_000:
+                raise ValueError("下載到的不是正常的程式檔")
+        dg = res.get("digest", "")
+        if dg.startswith("sha256:") and dg[7:].lower() != h.hexdigest().lower():
+            raise ValueError("檔案核對碼不符，可能下載不完整")
+        self.progress.emit(94, "安裝新版 …")
+        swap_file(tmp, SCRIPT)
+        self.progress.emit(100, "更新完成！")
+        self.done.emit(True, "")
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        self.done.emit(False, str(e))
+
+
+UpdateWorker._run_exe = _worker_run_exe
 
 
 class UpdateProgress(QDialog):
@@ -1240,36 +1244,1482 @@ class UpdateToast(QFrame):
         self.hide()
 
 
+# ---------------- 下載工具 (yt-dlp / ffmpeg 自動準備) ----------------
+IS_WIN = os.name == "nt"
+TOOLS_DIR = os.path.join(HERE, "tools")
+YTDLP_DIR = os.path.join(TOOLS_DIR, "yt_dlp_update")        # 自動下載的 yt-dlp 放這裡 (優先於系統內建的)
+FFMPEG_EXE = os.path.join(TOOLS_DIR, "ffmpeg.exe")
+FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+
+
+class DownloadStop(Exception):
+    pass
+
+
+def _tools_path():
+    if os.path.isdir(YTDLP_DIR) and YTDLP_DIR not in sys.path:
+        sys.path.insert(0, YTDLP_DIR)
+
+
+def have_ytdlp():
+    """真的載入一次才算「有」: 檔案在但壞掉(載入失敗)也算沒有，這樣會自動重新下載修復"""
+    try:
+        get_ytdlp()
+        return True
+    except Exception:
+        return False
+
+
+def get_ytdlp():
+    _tools_path()
+    import yt_dlp          # 一定要在函式裡 import，重新下載後才會拿到新載入的版本
+    return yt_dlp
+
+
+def reload_ytdlp():
+    """重新下載 yt-dlp 後，不用重開程式: 把舊的模組從記憶體清掉再載入新的"""
+    for k in [k for k in sys.modules if k == "yt_dlp" or k.startswith("yt_dlp.")]:
+        del sys.modules[k]
+    importlib.invalidate_caches()
+    _tools_path()
+    import yt_dlp
+    return yt_dlp
+
+
+def ytdlp_version():
+    try:
+        get_ytdlp()
+        import yt_dlp.version as v
+        return v.__version__
+    except Exception:
+        return ""
+
+
+def ffmpeg_path():
+    for p in (FFMPEG_EXE, os.path.join(HERE, "ffmpeg.exe")):
+        if os.path.exists(p):
+            return p
+    return shutil.which("ffmpeg") or ""
+
+
+def aria2c_path():
+    p = os.path.join(TOOLS_DIR, "aria2c.exe")
+    return p if os.path.exists(p) else (shutil.which("aria2c") or "")
+
+
+def install_ytdlp(cb=None):
+    """從 PyPI 下載最新版 yt-dlp (.whl 其實就是 zip)，核對雜湊值後解壓到 tools/yt_dlp_update。
+    先解壓到暫存資料夾，成功了才換掉舊版，所以失敗時舊版不會被弄壞。回傳 (成功?, 版本或錯誤訊息)"""
+    cb = cb or (lambda m: None)
+    new = YTDLP_DIR + ".new"
+    try:
+        cb("連線 PyPI 查詢最新版本...")
+        with urllib.request.urlopen("https://pypi.org/pypi/yt-dlp/json", timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        ver = data["info"]["version"]
+        files = data.get("urls") or data.get("releases", {}).get(ver, [])
+        whl = next((f for f in files if f.get("filename", "").endswith(".whl")), None)
+        if not whl:
+            return False, "在 PyPI 上找不到 yt-dlp 的安裝檔 (.whl)"
+        cb(f"下載 yt-dlp {ver} 中...")
+        with urllib.request.urlopen(whl["url"], timeout=90) as r:
+            blob = r.read()
+        want = (whl.get("digests") or {}).get("sha256")
+        if want and hashlib.sha256(blob).hexdigest() != want:
+            return False, "下載的檔案雜湊值對不上 (檔案可能損毀)，已取消安裝"
+        cb("安裝新版中...")
+        shutil.rmtree(new, ignore_errors=True)
+        os.makedirs(new, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(blob)) as z:
+            z.extractall(new)
+        shutil.rmtree(YTDLP_DIR, ignore_errors=True)
+        os.replace(new, YTDLP_DIR)
+        return True, ver
+    except Exception as e:
+        shutil.rmtree(new, ignore_errors=True)
+        return False, str(e)
+
+
+def install_ffmpeg(cb=None):
+    """下載 Windows 版 ffmpeg (BtbN 官方靜態編譯)，只取出 ffmpeg.exe 放到 tools 資料夾"""
+    cb = cb or (lambda m: None)
+    if not IS_WIN:
+        return False, "自動下載 ffmpeg 目前只支援 Windows，請自行安裝 ffmpeg 並加入 PATH"
+    tmp = os.path.join(TOOLS_DIR, "ffmpeg_download.tmp")
+    part = FFMPEG_EXE + ".part"
+    try:
+        os.makedirs(TOOLS_DIR, exist_ok=True)
+        cb("下載 ffmpeg 中 (檔案較大，請耐心等候)...")
+        req = urllib.request.Request(FFMPEG_URL, headers={"User-Agent": "ets2-player"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            got = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                cb(f"下載 ffmpeg 中... {got / 1048576:.0f}" + (f" / {total / 1048576:.0f} MB ({got * 100 // total}%)" if total else " MB"))
+        cb("解壓縮 ffmpeg.exe ...")
+        with zipfile.ZipFile(tmp) as z:
+            name = next((n for n in z.namelist() if n.replace("\\", "/").endswith("bin/ffmpeg.exe")), None)
+            if not name:
+                return False, "壓縮檔裡找不到 ffmpeg.exe，來源檔案格式可能變了"
+            with z.open(name) as src, open(part, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        os.replace(part, FFMPEG_EXE)
+        return True, "ffmpeg 已安裝完成"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        for p in (tmp, part):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def sanitize_folder_name(name):
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"_+", "_", name)
+    return name.strip("_ ")
+
+
+def load_archive(history_file):
+    ids = set()
+    if os.path.exists(history_file):
+        with open(history_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    ids.add(line.strip())
+    return ids
+
+
+def save_to_archive(history_file, vid):
+    with open(history_file, "a", encoding="utf-8") as f:
+        f.write(f"youtube {vid}\n")
+
+
+def in_archive(archived, vid):
+    return f"youtube {vid}" in archived
+
+
+SCAN_BATCH_SIZE = 100     # 掃描播放清單時，每批掃幾首
+MAX_RETRY_PER_GAP = 5     # 疑似分頁中斷時，同一個卡點最多重試幾次
+MAX_STALL = 3             # 整批請求失敗時，最多連續重試幾次
+
+
+def scan_playlist_all(yt, url, is_playlist, status_cb, from_index=1, stop=lambda: False):
+    """掃描播放清單，回傳 (資料夾名稱, 歌曲清單)。
+    YouTube 大型清單的分頁有時會中途斷掉，這裡用清單總數判斷是否真的到底，不夠就換起點重試。"""
+    if not is_playlist:
+        status_cb("🔍 解析單首中...", "blue")
+        opts = {"quiet": True, "extract_flat": True, "noplaylist": True, "ignoreerrors": True}
+        with yt.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if info is None:
+            return None, None
+        entries = [info] if info.get("id") else []
+        status_cb(f"✅ 共掃到 {len(entries)} 首", "green")
+        return "單曲下載", entries
+
+    BATCH = SCAN_BATCH_SIZE
+    all_entries, folder_name, count_hint = [], None, None
+    start, retry_count, stall_count, no_progress = from_index, 0, 0, 0
+    while not stop():
+        end = start + BATCH - 1
+        status_cb(f"🔍 掃描第 {start}~{end} 首中... 已掃 {len(all_entries)} 首"
+                  + (f" / 共{count_hint}首" if count_hint else ""), "blue")
+        opts = {"quiet": True, "extract_flat": "in_playlist", "noplaylist": False, "ignoreerrors": True,
+                "playliststart": start, "playlistend": end,
+                "extractor_args": {"youtubetab": {"skip": ["webpage"]}}}
+        try:
+            with yt.YoutubeDL(opts) as ydl:
+                res = ydl.extract_info(url, download=False)
+        except Exception:
+            res = None
+        if res is None:
+            stall_count += 1
+            if stall_count >= MAX_STALL:
+                break
+            status_cb(f"⚠️ 第 {start}~{end} 首抓取失敗，重試中...（第{stall_count}次）", "orange")
+            continue
+        if folder_name is None:
+            folder_name = sanitize_folder_name(res.get("title") or "YouTube下載")
+        if count_hint is None:
+            count_hint = res.get("playlist_count")
+        batch = [e for e in (res.get("entries") or []) if e and e.get("id")]
+        before = len(all_entries)
+        seen = {e["id"] for e in all_entries}
+        all_entries.extend(e for e in batch if e["id"] not in seen)
+        total = len(all_entries)
+        if len(batch) >= BATCH:                       # 這批是滿的 → 繼續下一批
+            stall_count = retry_count = no_progress = 0
+            start = end + 1
+            continue
+        # 這批不足: 可能真的到底，也可能是分頁中斷
+        suspect = (total < count_hint - 2) if count_hint is not None else True
+        if not suspect:
+            break
+        if retry_count >= MAX_RETRY_PER_GAP:
+            status_cb(f"⚠️ 已重試{MAX_RETRY_PER_GAP}次仍無法繼續，目前掃到{total}首"
+                      + (f"（清單共{count_hint}首）" if count_hint else "") + "，已掃到的部分仍會繼續下載", "orange")
+            break
+        if total == before:
+            no_progress += 1
+            if no_progress >= MAX_STALL:
+                break
+        else:
+            no_progress = 0
+        retry_count += 1
+        start = total + 1
+        status_cb(f"🔁 偵測到清單可能中斷（已掃{total}" + (f"/{count_hint}" if count_hint else "")
+                  + f"首），改從第{start}首重新嘗試...（第{retry_count}次重試）", "orange")
+
+    seen, unique = set(), []
+    for e in all_entries:
+        if e["id"] not in seen:
+            seen.add(e["id"])
+            unique.append(e)
+    status_cb(f"✅ 共掃到 {len(unique)} 首，開始下載...", "green")
+    return folder_name or "YouTube下載", unique
+
+
+class AltPicker(QDialog):
+    """下載失敗時，從搜尋到的替代版本裡選一首"""
+    def __init__(self, parent, title, cands):
+        super().__init__(parent)
+        self.setWindowTitle(f"選擇替代版本：{title}")
+        self.resize(640, 400)
+        self.cands, self.url = cands, None
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel(f"原曲下載失敗：{title}"))
+        hint = QLabel("以下是搜尋到的替代版本，請選一首或按「跳過」：")
+        hint.setObjectName("sub")
+        v.addWidget(hint)
+        self.lst = QListWidget()
+        for i, c in enumerate(cands):
+            d = int(c["dur"] or 0)
+            self.lst.addItem(f"{i + 1}. {c['title']}  [{d // 60}:{d % 60:02d}]")
+        v.addWidget(self.lst, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        ok, sk = QPushButton("✅ 下載這首"), QPushButton("⏭ 跳過")
+        ok.clicked.connect(self._pick)
+        sk.clicked.connect(self.reject)
+        row.addWidget(ok)
+        row.addWidget(sk)
+        v.addLayout(row)
+
+    def _pick(self):
+        r = self.lst.currentRow()
+        if r < 0:
+            QMessageBox.warning(self, "提示", "請先點選一首歌！")
+            return
+        self.url = self.cands[r]["url"]
+        self.accept()
+
+
+class DownloadDialog(QDialog):
+    """下載音樂 (YouTube 等網站，使用 yt-dlp)。下載完的歌自動加進播放器清單。"""
+    ui = Signal(object)          # 背景執行緒用: 丟一個函式回主執行緒執行
+
+    def __init__(self, pl):
+        super().__init__(pl)
+        self.pl = pl
+        self.setWindowTitle("下載音樂")
+        self.resize(800, 760)
+        self.ui.connect(lambda fn: fn())
+        self.running = self.tools_busy = False
+        self._stop = False
+        self.paths = {}
+        self.stats = {"ok": 0, "skip": 0, "fail": 0, "total": 0}
+        c = pl.cfg
+        v = QVBoxLayout(self)
+        t = QLabel("⬇ 下載音樂")
+        t.setObjectName("dtitle")
+        v.addWidget(t)
+        v.addWidget(QLabel("連結（單首或合輯/播放清單皆可）:"))
+        r = QHBoxLayout()
+        self.url = QLineEdit()
+        self.url.setPlaceholderText("貼上 YouTube 等網站的連結")
+        r.addWidget(self.url, 1)
+        pb = QPushButton("貼上")
+        pb.clicked.connect(lambda: self.url.setText(QApplication.clipboard().text().strip()))
+        r.addWidget(pb)
+        v.addLayout(r)
+
+        r = QHBoxLayout()
+        r.addWidget(QLabel("音質(kbps):"))
+        self.br = QComboBox(); self.br.addItems(["320", "256", "192", "128"]); self.br.setCurrentText(str(c["dl_br"]))
+        r.addWidget(self.br)
+        r.addSpacing(10)
+        r.addWidget(QLabel("多段下載:"))
+        self.seg = QComboBox(); self.seg.addItems(["1", "4", "8", "16"]); self.seg.setCurrentText(str(c["dl_seg"]))
+        self.seg.setToolTip("同時抓幾個片段 (對分片式串流有效)，1 = 不使用多段")
+        r.addWidget(self.seg)
+        r.addSpacing(10)
+        self.pl_cb = QCheckBox("合輯 / 播放清單模式")
+        self.pl_cb.setChecked(c["dl_playlist"])
+        r.addWidget(self.pl_cb)
+        r.addSpacing(10)
+        r.addWidget(QLabel("從第幾首開始:"))
+        self.start = NumBox(1, 1, 99999)
+        self.start.setToolTip("前段已下載時填入，例如填 109 從第109首繼續")
+        r.addWidget(self.start)
+        r.addStretch(1)
+        v.addLayout(r)
+
+        r = QHBoxLayout()
+        self.aria_cb = QCheckBox("aria2c 多線程 (單檔 16 條連線)")
+        self.aria_lbl = QLabel("")
+        self.aria_lbl.setObjectName("sub")
+        r.addWidget(self.aria_cb)
+        r.addWidget(self.aria_lbl, 1)
+        v.addLayout(r)
+
+        r = QHBoxLayout()
+        r.addWidget(QLabel("存到:"))
+        first = next((f for f, on in c["folders"].items() if on), "")
+        self.dst = QLineEdit(c["dl_dir"] or first or os.path.join(HERE, "下載"))
+        r.addWidget(self.dst, 1)
+        db = QPushButton("選擇資料夾…")
+        db.clicked.connect(self._pick_dst)
+        r.addWidget(db)
+        v.addLayout(r)
+
+        r = QHBoxLayout()
+        self.tools_lbl = QLabel("")
+        r.addWidget(self.tools_lbl, 1)
+        self.fix_y = QPushButton("🔧 重新下載 yt-dlp")
+        self.fix_y.setToolTip("yt-dlp 壞掉或過期時按這個，只會重抓 yt-dlp，不用動其他東西")
+        self.fix_y.clicked.connect(self.repair_ytdlp)
+        self.fix_f = QPushButton("⬇ 重新安裝 ffmpeg")
+        self.fix_f.clicked.connect(self.repair_ffmpeg)
+        r.addWidget(self.fix_y)
+        r.addWidget(self.fix_f)
+        v.addLayout(r)
+        self.tool_bar = QProgressBar()
+        self.tool_bar.setRange(0, 0)
+        self.tool_bar.setTextVisible(False)
+        self.tool_bar.hide()
+        v.addWidget(self.tool_bar)
+
+        v.addWidget(QLabel("歌曲清單（雙擊可在資料夾中定位檔案）:"))
+        self.listw = QListWidget()
+        self.listw.itemDoubleClicked.connect(self._open_loc)
+        v.addWidget(self.listw, 1)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        self.bar.setTextVisible(False)
+        v.addWidget(self.bar)
+        self.status = QLabel("準備就緒")
+        v.addWidget(self.status)
+        self.summary = QLabel("")
+        self.summary.setObjectName("sub")
+        v.addWidget(self.summary)
+        tip = QLabel("每個合輯資料夾都有獨立的 download_history.txt，重複的歌會自動跳過。請只下載你有權下載的內容，並遵守網站規定。")
+        tip.setObjectName("sub")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+
+        r = QHBoxLayout()
+        self.go = QPushButton("🚀 開始下載（自動跳過已有）")
+        self.go.clicked.connect(self.start_download)
+        self.stop_btn = QPushButton("⏹ 停止")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._do_stop)
+        self.hist_btn = QPushButton("🔧 修復下載記錄")
+        self.hist_btn.setToolTip("資料夾裡已經有檔案、但沒有記錄時，用原本的清單網址把記錄補齊")
+        self.hist_btn.clicked.connect(self.fix_history)
+        close = QPushButton("關閉")
+        close.clicked.connect(self.hide)
+        for b in (self.go, self.stop_btn, self.hist_btn):
+            r.addWidget(b)
+        r.addStretch(1)
+        r.addWidget(close)
+        v.addLayout(r)
+        self._summary()
+        self.refresh_tools()
+
+    # ---- 小工具 ----
+    def _pick_dst(self):
+        d = QFileDialog.getExistingDirectory(self, "選擇下載位置", self.dst.text())
+        if d:
+            self.dst.setText(os.path.normpath(d))
+
+    def _row(self, i, text):
+        it = self.listw.item(i)
+        if it:
+            it.setText(text)
+            self.listw.scrollToItem(it)
+
+    def _summary(self):
+        s = self.stats
+        self.summary.setText(f"✅ 新下載: {s['ok']}  |  ⏭️ 已有跳過: {s['skip']}  |  ⚠️ 無法下載: {s['fail']}  |  共: {s['total']}")
+
+    def _ask(self, fn):
+        """背景執行緒要問使用者時: 在主執行緒執行 fn，等結果回來"""
+        box, ev = {}, threading.Event()
+
+        def run():
+            try:
+                box["r"] = fn()
+            finally:
+                ev.set()
+        self.ui.emit(run)
+        ev.wait()
+        return box.get("r")
+
+    def _open_loc(self, item):
+        p = self.paths.get(self.listw.row(item))
+        if p and os.path.exists(p):
+            try:
+                if IS_WIN:
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(p)])
+                else:
+                    subprocess.Popen(["xdg-open", os.path.dirname(p)])
+            except Exception:
+                pass
+        else:
+            QMessageBox.information(self, "提示", "找不到這首歌的實際檔案。可能還沒下載完成、下載失敗被跳過，或檔案之後被移動/刪除了。")
+
+    def _do_stop(self):
+        self._stop = True
+        self.status.setText("⏹ 停止中...")
+
+    # ---- 元件 (yt-dlp / ffmpeg) ----
+    def refresh_tools(self):
+        has_y = have_ytdlp()
+        v = ytdlp_version() if has_y else ""
+        ff = ffmpeg_path()
+        self.tools_lbl.setText(f"yt-dlp: {('✅ ' + v) if has_y else '❌ 未安裝或壞掉'}　　ffmpeg: {'✅ 已就緒' if ff else '❌ 未安裝'}")
+        a = aria2c_path()
+        self.aria_cb.setEnabled(bool(a))
+        self.aria_cb.setChecked(bool(a) and self.pl.cfg["dl_aria2"])
+        self.aria_lbl.setText("✅ 已偵測到 aria2c" if a else "未偵測到 aria2c (把 aria2c.exe 放進 tools 資料夾即可啟用)")
+        busy = self.running or self.tools_busy
+        self.go.setEnabled(has_y and bool(ff) and not busy)
+        self.fix_y.setEnabled(not busy)
+        self.fix_f.setEnabled(not busy)
+        self.hist_btn.setEnabled(has_y and not busy)
+
+    def ensure_tools(self):
+        """打開視窗時檢查: 缺什麼就自動下載什麼"""
+        if self.tools_busy or self.running:
+            return
+        need_y, need_f = not have_ytdlp(), not ffmpeg_path()
+        if need_y or need_f:
+            self._run_tools(need_y, need_f)
+
+    def repair_ytdlp(self):
+        if self.running:
+            QMessageBox.information(self, "提示", "下載進行中，請先按「停止」再重新下載 yt-dlp。")
+            return
+        self._run_tools(True, False)
+
+    def repair_ffmpeg(self):
+        if self.running:
+            QMessageBox.information(self, "提示", "下載進行中，請先按「停止」再重新安裝 ffmpeg。")
+            return
+        self._run_tools(False, True)
+
+    def _run_tools(self, do_y, do_f):
+        self.tools_busy = True
+        self.tool_bar.show()
+        self.refresh_tools()
+
+        def cb(m):
+            self.ui.emit(lambda: self.status.setText("🔄 " + m))
+
+        def work():
+            msgs = []
+            if do_y:
+                ok, info = install_ytdlp(cb)
+                if ok:
+                    try:
+                        reload_ytdlp()
+                    except Exception as e:
+                        msgs.append(f"yt-dlp 安裝了，但載入失敗: {e}")
+                else:
+                    msgs.append(f"yt-dlp: {info}")
+            if do_f:
+                ok, info = install_ffmpeg(cb)
+                if not ok:
+                    msgs.append(f"ffmpeg: {info}")
+            self.ui.emit(lambda: self._tools_done(msgs))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _tools_done(self, msgs):
+        self.tools_busy = False
+        self.tool_bar.hide()
+        self.status.setText("準備就緒" if not msgs else "⚠️ 元件安裝失敗")
+        self.refresh_tools()
+        if msgs:
+            QMessageBox.warning(self, "元件安裝失敗", "\n".join(msgs) + "\n\n請檢查網路連線，再按上方的「重新下載」按鈕重試。")
+
+    # ---- 下載 ----
+    def start_download(self):
+        url = self.url.text().strip()
+        base = self.dst.text().strip()
+        if not url:
+            QMessageBox.warning(self, "提示", "請貼上網址！")
+            return
+        if not base:
+            QMessageBox.warning(self, "提示", "請選擇下載位置！")
+            return
+        try:
+            os.makedirs(base, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "提示", f"無法建立資料夾:\n{e}")
+            return
+        o = {"br": self.br.currentText(), "seg": int(self.seg.currentText()), "playlist": self.pl_cb.isChecked(),
+             "start": self.start.value(), "aria": self.aria_cb.isChecked()}
+        c = self.pl.cfg
+        c.update(dl_dir=base, dl_br=o["br"], dl_seg=o["seg"], dl_playlist=o["playlist"], dl_aria2=o["aria"])
+        save_cfg(c)
+        self.running, self._stop = True, False
+        self.go.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.hist_btn.setEnabled(False)
+        self.fix_y.setEnabled(False)
+        self.fix_f.setEnabled(False)
+        self.listw.clear()
+        self.paths.clear()
+        self.stats.update(ok=0, skip=0, fail=0, total=0)
+        self._summary()
+        threading.Thread(target=self._run_job, args=(url, base, o), daemon=True).start()
+
+    def _job_done(self, save_path):
+        self.running = False
+        self.stop_btn.setEnabled(False)
+        self.status.setText("準備就緒")
+        self.bar.setValue(0)
+        self.refresh_tools()
+        if save_path and os.path.isdir(save_path):
+            self.pl.after_download(save_path)
+
+    def _run_job(self, url, base, o):
+        st = self.stats
+        save_path = None
+        try:
+            yt = get_ytdlp()
+
+            def status_cb(text, color=None):
+                self.ui.emit(lambda: self.status.setText(text))
+            folder_name, entries = scan_playlist_all(yt, url, o["playlist"], status_cb, o["start"], lambda: self._stop)
+            if self._stop:
+                return
+            if folder_name is None:
+                self._ask(lambda: QMessageBox.critical(self, "失敗", "無法解析連結，請確認網址是否正確。"))
+                return
+            if not entries:
+                self._ask(lambda: QMessageBox.critical(self, "失敗", "掃描結果為空，請確認連結或網路狀態。"))
+                return
+            save_path = os.path.join(base, folder_name)
+            os.makedirs(save_path, exist_ok=True)
+            history_file = os.path.join(save_path, "download_history.txt")
+            archived = load_archive(history_file)
+            st["total"] = len(entries)
+            for i, e in enumerate(entries):
+                title = e.get("title") or f"(未知 {i + 1})"
+                if in_archive(archived, e.get("id", "")):
+                    st["skip"] += 1
+                    txt = f"⏭️ [{i + 1}] {title}  (已有)"
+                else:
+                    txt = f"⏳ [{i + 1}] {title}"
+                self.ui.emit(lambda t=txt: self.listw.addItem(t))
+            self.ui.emit(self._summary)
+
+            opts = {
+                "outtmpl": os.path.join(save_path, "%(title).80s.%(ext)s"),   # 標題截 80 字，避免超過 Windows 260 字元路徑限制
+                "windowsfilenames": True,
+                "ffmpeg_location": ffmpeg_path(),
+                "noplaylist": True, "continuedl": True, "quiet": True, "no_warnings": True,
+                "concurrent_fragment_downloads": o["seg"],
+                "format": "bestaudio/best",
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": o["br"]}],
+            }
+            aria = aria2c_path() if o["aria"] else ""
+            if aria:
+                os.environ["PATH"] = os.path.dirname(aria) + os.pathsep + os.environ.get("PATH", "")
+                opts["external_downloader"] = "aria2c"
+                opts["external_downloader_args"] = {"aria2c": ["-x16", "-s16", "-k1M"]}
+            Cancel = getattr(getattr(yt, "utils", None), "DownloadCancelled", DownloadStop)
+            failed, done = [], {"n": 0}
+
+            def hooks(i, title):
+                last = {"p": -1}
+
+                def ph(d):
+                    if self._stop:
+                        raise Cancel()
+                    if d["status"] == "downloading":
+                        tot = d.get("total_bytes") or d.get("total_bytes_estimate")
+                        if tot:
+                            p = d.get("downloaded_bytes", 0) * 100 / tot
+                            if int(p * 10) != last["p"]:
+                                last["p"] = int(p * 10)
+                                self.ui.emit(lambda: self._row(i, f"🚀 [{i + 1}] {title}  ({p:.1f}%)"))
+                    elif d["status"] == "finished":
+                        if d.get("filename"):
+                            self.paths[i] = d["filename"]
+                        self.ui.emit(lambda: self._row(i, f"⚙️ [{i + 1}] {title}  (轉碼中...)"))
+
+                def pp(d):
+                    if d.get("status") == "finished":          # 轉成 mp3 後，這裡拿到的才是最終檔案路徑
+                        info = d.get("info_dict") or {}
+                        fp = info.get("filepath") or info.get("_filename")
+                        if fp:
+                            self.paths[i] = fp
+                return ph, pp
+
+            def download_one(i, e):
+                vid, title = e.get("id", ""), e.get("title") or f"未知 {i + 1}"
+                self.ui.emit(lambda: self._row(i, f"🚀 [{i + 1}] {title}  (準備中...)"))
+                ph, pp = hooks(i, title)
+                o2 = dict(opts, progress_hooks=[ph], postprocessor_hooks=[pp])
+                ok, err = False, ""
+                try:
+                    with yt.YoutubeDL(o2) as y:
+                        ok = (y.download([f"https://www.youtube.com/watch?v={vid}"]) == 0)
+                except Cancel:
+                    return "stop"
+                except Exception as ex:
+                    err = (str(ex).strip().splitlines() or [ex.__class__.__name__])[-1][:90]
+                if self._stop:
+                    return "stop"
+                if not ok:                                   # 轉檔階段才出錯，但檔案其實已經產生的情況
+                    exts = {".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus", ".wma"}
+                    key = title.lower()[:15]
+                    try:
+                        ok = any(key in f.lower() for f in os.listdir(save_path) if os.path.splitext(f)[1].lower() in exts)
+                    except OSError:
+                        ok = False
+                done["n"] += 1
+                pct = int(done["n"] * 100 / max(1, st["total"]))
+                self.ui.emit(lambda: self.bar.setValue(pct))
+                if ok:
+                    save_to_archive(history_file, vid)
+                    archived.add(f"youtube {vid}")
+                    st["ok"] += 1
+                    self.ui.emit(lambda: self._row(i, f"✅ [{i + 1}] {title}"))
+                else:
+                    st["fail"] += 1
+                    failed.append({"index": i, "title": title})
+                    self.ui.emit(lambda: self._row(i, f"⚠️ [{i + 1}] {title}  (無法下載" + (f": {err}" if err else "") + ")"))
+                self.ui.emit(self._summary)
+                return ok
+
+            for i, e in enumerate(entries):
+                if in_archive(archived, e.get("id", "")):
+                    continue
+                if self._stop or download_one(i, e) == "stop":
+                    break
+            if self._stop:
+                self.ui.emit(lambda: self.status.setText("⏹ 已停止"))
+                return
+
+            if failed:
+                go = self._ask(lambda: QMessageBox.question(
+                    self, "下載完成 — 有歌曲失敗",
+                    f"✅ 本次新下載：{st['ok']} 首\n⏭️ 已有自動跳過：{st['skip']} 首\n⚠️ 無法下載：{st['fail']} 首\n\n"
+                    f"有 {len(failed)} 首下載失敗，要自動搜尋替代版本嗎？",
+                    QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes)
+                if go:
+                    self._alt_search(yt, failed, opts, hooks)
+            s = st
+            self.ui.emit(lambda: QMessageBox.information(
+                self, "全部完成",
+                f"🎉 全部處理完畢！\n\n✅ 成功下載：{s['ok']} 首\n⏭️ 已有自動跳過：{s['skip']} 首\n⚠️ 無法下載：{s['fail']} 首\n"
+                f"────────────────\n📋 合計掃描：{s['total']} 首\n\n新下載的歌已加進播放清單。"))
+        except Exception as err:
+            msg = str(err)
+            self.ui.emit(lambda: QMessageBox.critical(self, "失敗", f"下載失敗！\n如果是 yt-dlp 的問題，請按「重新下載 yt-dlp」再試。\n\n錯誤：{msg}"))
+        finally:
+            self.ui.emit(lambda: self._job_done(save_path))
+
+    def _alt_search(self, yt, failed, opts, hooks):
+        st = self.stats
+        self.ui.emit(lambda: self.status.setText("🔍 搜尋替代版本中..."))
+
+        def alt_one(song):
+            i, title = song["index"], song["title"]
+            self.ui.emit(lambda: self._row(i, f"🔍 [{i + 1}] {title}  (搜尋替代中...)"))
+            try:
+                q = re.sub(r"[(（][^)）]*[)）]", "", title).strip() or title
+                cands = []
+
+                def fetch(query):
+                    with yt.YoutubeDL({"quiet": True, "noplaylist": True, "ignoreerrors": True,
+                                       "extract_flat": False, "skip_download": True}) as ydl:
+                        res = ydl.extract_info(query, download=False)
+                    if not res:
+                        return
+                    for en in (res.get("entries") or ([res] if res.get("id") else [])):
+                        if not en:
+                            continue
+                        vid, ttl = en.get("id", ""), en.get("title", "")
+                        if vid and ttl:
+                            cands.append({"id": vid, "title": f"[{en.get('extractor_key', 'YouTube')}] {ttl}",
+                                          "dur": en.get("duration") or 0,
+                                          "url": en.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"})
+                for query in (f"ytsearch5:{q}", f"ytsearch3:{q} 歌詞", f"bilisearch5:{q}"):
+                    try:
+                        fetch(query)
+                    except Exception:
+                        pass
+                seen, uniq = set(), []
+                for c in cands:
+                    if c["id"] not in seen:
+                        seen.add(c["id"])
+                        uniq.append(c)
+                cands = uniq[:10]
+                if not cands:
+                    self.ui.emit(lambda: self._row(i, f"⚠️ [{i + 1}] {title}  (找不到替代)"))
+                    return
+
+                def pick():
+                    d = AltPicker(self, title, cands)
+                    return d.url if d.exec() else None
+                url = self._ask(pick)
+                if not url:
+                    self.ui.emit(lambda: self._row(i, f"⏭️ [{i + 1}] {title}  (跳過)"))
+                    return
+                self.ui.emit(lambda: self._row(i, f"🚀 [{i + 1}] {title}  (下載替代版本...)"))
+                ph, pp = hooks(i, title)
+                with yt.YoutubeDL(dict(opts, progress_hooks=[ph], postprocessor_hooks=[pp])) as y:
+                    ok = (y.download([url]) == 0)
+                if ok:
+                    st["ok"] += 1
+                    st["fail"] -= 1
+                    self.ui.emit(lambda: self._row(i, f"✅ [{i + 1}] {title}  (替代版本)"))
+                    self.ui.emit(self._summary)
+                else:
+                    self.ui.emit(lambda: self._row(i, f"⚠️ [{i + 1}] {title}  (替代也失敗)"))
+            except Exception:
+                self.ui.emit(lambda: self._row(i, f"⚠️ [{i + 1}] {title}  (替代也失敗)"))
+
+        for song in sorted(failed, key=lambda x: x["index"]):
+            if self._stop:
+                return
+            alt_one(song)
+
+    # ---- 修復下載記錄 ----
+    def fix_history(self):
+        url = self.url.text().strip()
+        if not url:
+            QMessageBox.warning(self, "提示", "請先在上方貼上原本的清單網址！")
+            return
+        target = QFileDialog.getExistingDirectory(self, "選擇要修復記錄的下載資料夾（清單資料夾）", self.dst.text())
+        if not target:
+            return
+        self.running = True
+        self.refresh_tools()
+
+        def work():
+            try:
+                yt = get_ytdlp()
+                exts = {".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus", ".wma"}
+                existing = {os.path.splitext(f)[0].lower().strip() for f in os.listdir(target) if os.path.splitext(f)[1].lower() in exts}
+
+                def status_cb(text, color=None):
+                    self.ui.emit(lambda: self.status.setText("🔧 " + text))
+                _, entries = scan_playlist_all(yt, url, True, status_cb)
+                if not entries:
+                    self.ui.emit(lambda: QMessageBox.critical(self, "失敗", "無法解析連結！"))
+                    return
+                hf = os.path.join(target, "download_history.txt")
+                archived, matched = load_archive(hf), 0
+                for e in entries:
+                    vid, title = e.get("id", ""), (e.get("title") or "").lower().strip()
+                    if not vid or in_archive(archived, vid):
+                        continue
+                    key = title[:10] if len(title) >= 6 else title
+                    if key and any(key in f for f in existing):
+                        save_to_archive(hf, vid)
+                        archived.add(f"youtube {vid}")
+                        matched += 1
+                self.ui.emit(lambda: QMessageBox.information(self, "修復完成", f"🔧 修復完成！\n\n✅ 補寫記錄：{matched} 首\n\n下次下載同一個清單，這些歌就會自動跳過了！"))
+            except Exception as err:
+                msg = str(err)
+                self.ui.emit(lambda: QMessageBox.critical(self, "失敗", f"修復失敗！\n\n錯誤：{msg}"))
+            finally:
+                def fin():
+                    self.running = False
+                    self.status.setText("準備就緒")
+                    self.refresh_tools()
+                self.ui.emit(fin)
+        threading.Thread(target=work, daemon=True).start()
+
+
+# ---------------- 桌布幻燈片 ----------------
+def scan_images(folder):
+    out = []
+    for root, _, files in os.walk(folder):
+        for n in files:
+            if n.lower().endswith(IMG_EXTS):
+                out.append(os.path.join(root, n))
+    return sorted(out, key=lambda p: p.lower())
+
+
+def make_thumb(path, w=96, h=54):
+    """縮圖 (用 QImageReader 直接讀縮小版，大圖也不會卡)"""
+    r = QImageReader(path)
+    sz = r.size()
+    if sz.isValid() and sz.width() > 0:
+        r.setScaledSize(sz.scaled(w, h, Qt.KeepAspectRatio))
+    img = r.read()
+    return QIcon(QPixmap.fromImage(img)) if not img.isNull() else QIcon()
+
+
+class SlideshowDialog(QDialog):
+    def __init__(self, pl):
+        super().__init__(pl)
+        self.pl = pl
+        c = pl.cfg
+        self.setWindowTitle("桌布幻燈片")
+        self.resize(620, 560)
+        v = QVBoxLayout(self)
+        self.on = QCheckBox("啟用桌布幻燈片")
+        self.on.setChecked(c["wp_slide"])
+        v.addWidget(self.on)
+
+        r = QHBoxLayout()
+        r.addWidget(QLabel("圖片來源:"))
+        self.src = QComboBox()
+        self.src.addItems(["圖片資料夾 (自動抓裡面所有圖片)", "自己一張一張挑"])
+        self.src.setCurrentIndex(1 if c["wp_source"] == "picked" else 0)
+        r.addWidget(self.src, 1)
+        v.addLayout(r)
+
+        # --- 資料夾模式 ---
+        self.folder_box = QWidget()
+        fv = QVBoxLayout(self.folder_box)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.addWidget(QLabel("圖片資料夾 (會連子資料夾一起找，依檔名排序):"))
+        r = QHBoxLayout()
+        self.dir = QLineEdit(c["wp_dir"])
+        self.dir.setReadOnly(True)
+        r.addWidget(self.dir, 1)
+        b = QPushButton("選擇資料夾…")
+        b.clicked.connect(self._pick)
+        r.addWidget(b)
+        fv.addLayout(r)
+        v.addWidget(self.folder_box)
+
+        # --- 一張一張挑模式 ---
+        self.pick_box = QWidget()
+        pv = QVBoxLayout(self.pick_box)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.addWidget(QLabel("挑好的圖片 (「按順序」時照這裡由上到下的順序換):"))
+        self.files = QListWidget()
+        self.files.setIconSize(QSize(96, 54))
+        self.files.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        pv.addWidget(self.files, 1)
+        r = QHBoxLayout()
+        for txt, fn in (("＋加入圖片…", self._add_dialog), ("移除選取", self._remove), ("↑ 上移", lambda: self._move(-1)),
+                        ("↓ 下移", lambda: self._move(1)), ("清空", self._clear)):
+            b = QPushButton(txt)
+            b.clicked.connect(fn)
+            r.addWidget(b)
+        r.addStretch(1)
+        pv.addLayout(r)
+        v.addWidget(self.pick_box, 1)
+        for p in c["wp_files"]:
+            self._add_item(p)
+
+        self.count = QLabel("")
+        self.count.setObjectName("sub")
+        v.addWidget(self.count)
+        r = QHBoxLayout()
+        r.addWidget(QLabel("換圖時機:"))
+        self.mode = QComboBox()
+        self.mode.addItems(WP_MODES)
+        self.mode.setCurrentText(c["wp_mode"])
+        r.addWidget(self.mode, 1)
+        v.addLayout(r)
+        r = QHBoxLayout()
+        r.addWidget(QLabel("順序:"))
+        self.order = QComboBox()
+        self.order.addItems(["按順序", "隨機"])
+        self.order.setCurrentIndex(1 if c["wp_shuffle"] else 0)
+        r.addWidget(self.order, 1)
+        v.addLayout(r)
+        self.fade = QCheckBox("換圖時淡入淡出")
+        self.fade.setChecked(c["wp_fade"])
+        v.addWidget(self.fade)
+        r = QHBoxLayout()
+        nb = QPushButton("立即換下一張")
+        nb.clicked.connect(self._next)
+        r.addWidget(nb)
+        r.addStretch(1)
+        cl = QPushButton("關閉")
+        cl.clicked.connect(self.accept)
+        r.addWidget(cl)
+        v.addLayout(r)
+        self._show_source()
+        for w in (self.on, self.fade):
+            w.toggled.connect(lambda *_: self._apply())
+        for w in (self.mode, self.order):
+            w.currentIndexChanged.connect(lambda *_: self._apply())
+        self.src.currentIndexChanged.connect(lambda *_: (self._show_source(), self._apply()))
+        self._count()
+
+    def _show_source(self):
+        picked = self.src.currentIndex() == 1
+        self.pick_box.setVisible(picked)
+        self.folder_box.setVisible(not picked)
+
+    # ---- 一張一張挑 ----
+    def _paths(self):
+        return [self.files.item(i).data(Qt.UserRole) for i in range(self.files.count())]
+
+    def _add_item(self, path):
+        it = QListWidgetItem(os.path.basename(path))
+        it.setData(Qt.UserRole, path)
+        it.setToolTip(path)
+        if os.path.isfile(path):
+            it.setIcon(make_thumb(path))
+        else:
+            it.setText(os.path.basename(path) + "  (找不到檔案)")
+        self.files.addItem(it)
+
+    def add_files(self, paths):
+        have = set(self._paths())
+        added = False
+        for p in paths:
+            p = os.path.normpath(p)
+            if p not in have and p.lower().endswith(IMG_EXTS):
+                self._add_item(p)
+                have.add(p)
+                added = True
+        if added:
+            self._apply()
+
+    def _add_dialog(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "挑桌布圖片 (可按住 Ctrl / Shift 一次選多張)", "",
+                                             "圖片 (*.jpg *.jpeg *.png *.bmp *.webp)")
+        if fs:
+            self.add_files(fs)
+
+    def _remove(self):
+        for it in self.files.selectedItems():
+            self.files.takeItem(self.files.row(it))
+        self._apply()
+
+    def _clear(self):
+        self.files.clear()
+        self._apply()
+
+    def _move(self, d):
+        rows = sorted((self.files.row(i) for i in self.files.selectedItems()), reverse=(d > 0))
+        if not rows:
+            return
+        for r in rows:
+            nr = r + d
+            if 0 <= nr < self.files.count() and nr not in rows:
+                self.files.insertItem(nr, self.files.takeItem(r))
+        for r in rows:
+            n = r + d
+            if 0 <= n < self.files.count():
+                self.files.item(n).setSelected(True)
+        self._apply()
+
+    # ---- 共用 ----
+    def _count(self):
+        n = len(self.pl._wp_list)
+        if self.src.currentIndex() == 1:
+            miss = self.files.count() - n
+            self.count.setText(f"已挑 {n} 張" + (f"（另有 {miss} 張找不到檔案，會自動略過）" if miss > 0 else "")
+                               if self.files.count() else "還沒挑圖片，按「＋加入圖片…」")
+        else:
+            self.count.setText(f"找到 {n} 張圖片" if self.dir.text() else "還沒選擇資料夾")
+
+    def _pick(self):
+        d = QFileDialog.getExistingDirectory(self, "選擇放桌布圖片的資料夾", self.dir.text())
+        if d:
+            self.dir.setText(os.path.normpath(d))
+            self._apply()
+
+    def _apply(self):
+        c = self.pl.cfg
+        c["wp_source"] = "picked" if self.src.currentIndex() == 1 else "folder"
+        c["wp_files"] = self._paths()
+        c["wp_dir"] = self.dir.text()
+        c["wp_slide"] = self.on.isChecked()
+        c["wp_mode"] = self.mode.currentText()
+        c["wp_shuffle"] = self.order.currentIndex() == 1
+        c["wp_fade"] = self.fade.isChecked()
+        save_cfg(c)
+        self.pl._slideshow_changed()
+        self._count()
+        if c["wp_slide"] and self.pl._wp_list and c["wallpaper"] not in self.pl._wp_list:
+            self.pl.next_wallpaper()            # 剛開啟(或換了來源)時，馬上換成清單裡的圖
+
+    def _next(self):
+        if not self.pl.next_wallpaper():
+            QMessageBox.information(self, "桌布幻燈片", "請先選擇圖片資料夾，或挑幾張圖片。")
+
+
+# ---------------- 天氣 (中央氣象署資料，經 GitHub 自動更新；境外地點用 Open-Meteo 備援) ----------------
+WX_CODE = {0: "晴天", 1: "大致晴朗", 2: "多雲", 3: "陰天", 45: "有霧", 48: "霧淞", 51: "毛毛雨", 53: "毛毛雨", 55: "濃密毛毛雨",
+           56: "凍毛毛雨", 57: "凍毛毛雨", 61: "小雨", 63: "中雨", 65: "大雨", 66: "凍雨", 67: "凍雨", 71: "小雪", 73: "中雪",
+           75: "大雪", 77: "雪粒", 80: "陣雨", 81: "陣雨", 82: "強陣雨", 85: "陣雪", 86: "強陣雪", 95: "雷雨",
+           96: "雷雨夾小冰雹", 99: "雷雨夾大冰雹"}
+
+
+def wx_text(code):
+    return WX_CODE.get(code, "天氣不明") if code is not None else "天氣不明"
+
+
+def wx_icon(code):
+    if code is None:
+        return "❔"
+    if code == 0:
+        return "☀️"
+    if code == 1:
+        return "🌤️"
+    if code == 2:
+        return "⛅"
+    if code == 3:
+        return "☁️"
+    if code in (45, 48):
+        return "🌫️"
+    if code in (51, 53, 55, 56, 57, 80, 81, 82):
+        return "🌦️"
+    if code in (61, 63, 65, 66, 67):
+        return "🌧️"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "🌨️"
+    if code in (95, 96, 99):
+        return "⛈️"
+    return "🌡️"
+
+
+def link_label(prefix, url, text):
+    """可點的連結標籤。顏色要用 <span> 包在連結裡才有效 (樣式表會蓋掉調色盤)，深色背景上才看得清楚。"""
+    lb = QLabel(f'{prefix}<a href="{url}"><span style="color:#8ab4ff; text-decoration: underline;">{text}</span></a>')
+    lb.setOpenExternalLinks(True)
+    return lb
+
+
+def fetch_json(url, timeout=15):
+    return json.loads(fetch_text(url, timeout))
+
+
+def geocode_openmeteo(name):
+    """城市/鄉鎮名 → 座標清單 (Open-Meteo 地名查詢，支援中文)"""
+    q = urllib.parse.quote(name.strip())
+    data = fetch_json(f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=8&language=zh&format=json")
+    out = []
+    for r in data.get("results") or []:
+        if r.get("latitude") is None or r.get("longitude") is None:
+            continue
+        admin = " ".join(x for x in (r.get("admin2"), r.get("admin1")) if x and x != r.get("name"))
+        out.append({"name": r.get("name", ""), "admin": admin, "country": r.get("country", ""),
+                    "lat": float(r["latitude"]), "lon": float(r["longitude"])})
+    return out
+
+
+def fetch_weather_openmeteo(lat, lon):
+    """目前氣溫 + 今天起 3 天的預報 (最高/最低溫、降雨機率、天氣代碼)"""
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,weather_code"
+           "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code"
+           "&timezone=auto&forecast_days=3") % (lat, lon)
+    d = fetch_json(url)
+    cur, dy = d.get("current") or {}, d.get("daily") or {}
+
+    def pick(key, i):
+        arr = dy.get(key) or []
+        return arr[i] if i < len(arr) else None
+    days = [{"date": day, "tmax": pick("temperature_2m_max", i), "tmin": pick("temperature_2m_min", i),
+             "pop": pick("precipitation_probability_max", i), "code": pick("weather_code", i)}
+            for i, day in enumerate(dy.get("time") or [])]
+    if not days:
+        raise ValueError("沒有收到預報資料")
+    return {"ts": time.time(), "temp": cur.get("temperature_2m"), "code": cur.get("weather_code"), "days": days}
+
+
+_CWA_CACHE = {"ts": 0.0, "data": None}
+
+
+def cwa_url():
+    """weather.json 的網址 (由 GitHub Actions 定時更新，授權碼只存在 GitHub Secrets，不在這個程式裡)。"""
+    if os.environ.get("TRUCK_WEATHER_URL"):          # 測試用
+        return os.environ["TRUCK_WEATHER_URL"]
+    rp = parse_repo(default_src())
+    if not rp:
+        return ""
+    return f"https://raw.githubusercontent.com/{rp[0]}/{rp[1]}/weather-data/weather.json"
+
+
+def cwa_data(force=False):
+    if not force and _CWA_CACHE["data"] and time.time() - _CWA_CACHE["ts"] < 600:
+        return _CWA_CACHE["data"]
+    url = cwa_url()
+    if not url:
+        raise ValueError("沒有設定氣象資料來源")
+    d = fetch_json(url, 20)
+    if not d.get("stations") or not d.get("counties"):
+        raise ValueError("氣象資料內容不完整")
+    _CWA_CACHE.update(ts=time.time(), data=d)
+    return d
+
+
+def _norm_place(t):
+    return (t or "").replace("台", "臺").replace(" ", "").strip()
+
+
+def _km(lat1, lon1, lat2, lon2):
+    import math
+    p = math.pi / 180
+    a = math.sin((lat2 - lat1) * p / 2) ** 2 + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2
+    return 12742 * math.asin(math.sqrt(a))
+
+
+def fetch_weather_cwa(lat, lon):
+    d = cwa_data()
+    best, bd = None, 1e9
+    for st in d["stations"]:
+        k = _km(lat, lon, st["la"], st["lo"])
+        if k < bd:
+            best, bd = st, k
+    if best is None or bd > 40:
+        raise ValueError("這個位置離台灣的氣象站太遠")
+    cd = d["counties"].get(best["c"]) or {}
+    days = cd.get("days") or []
+    if not days:
+        raise ValueError("沒有收到預報資料")
+    d0 = days[0]
+    return {"ts": time.time(), "temp": best.get("temp"), "code": best.get("code") if best.get("wx") else d0.get("code"),
+            "text": best.get("wx") or d0.get("text"), "days": days, "src": "cwa",
+            "place": f"{best['c']}{best.get('t', '')}", "updated": d.get("updated", "")}
+
+
+def geocode_cwa(name):
+    d = cwa_data()
+    q = _norm_place(name)
+    if not q:
+        return []
+    seen, out = set(), []
+    for st in d["stations"]:
+        key = (st["c"], st.get("t", ""))
+        town = _norm_place(st.get("t", ""))
+        cty = _norm_place(st["c"])
+        hit = q in town or q in cty or q in _norm_place(st["n"]) or (town and town in q) or (q.startswith(cty) and q[len(cty):] in town)
+        if hit and key not in seen:
+            seen.add(key)
+            out.append({"name": st.get("t") or st["c"], "admin": st["c"], "country": "台灣", "lat": st["la"], "lon": st["lo"]})
+    return out[:12]
+
+
+def geocode(name):
+    """先用中央氣象署資料找台灣的縣市/鄉鎮；找不到或讀不到才用 Open-Meteo (可搜尋國外)。"""
+    local, err = [], ""
+    try:
+        local = geocode_cwa(name)
+    except Exception as e:
+        err = str(e)
+    if local:
+        return local
+    try:
+        return geocode_openmeteo(name)
+    except Exception as e:
+        if err:
+            raise RuntimeError(f"氣象資料讀取失敗 ({err})；備援查詢也失敗 ({e})")
+        raise
+
+
+def fetch_weather(lat, lon):
+    """台灣地點用中央氣象署資料；境外或讀不到時用 Open-Meteo 備援。"""
+    try:
+        return fetch_weather_cwa(lat, lon)
+    except Exception as e1:
+        try:
+            r = fetch_weather_openmeteo(lat, lon)
+            r["src"] = "om"
+            return r
+        except Exception as e2:
+            raise RuntimeError(f"{e1}；備援也失敗 ({e2})")
+
+
+def locate_windows():
+    """用 Windows 的定位服務取得目前位置 (緯度, 經度)。失敗丟 RuntimeError(說明)。"""
+    if not IS_WIN:
+        raise RuntimeError("自動定位目前只支援 Windows，請改用搜尋地區名稱。")
+    ps = ("Add-Type -AssemblyName System.Device;"
+          "$w=New-Object System.Device.Location.GeoCoordinateWatcher([System.Device.Location.GeoPositionAccuracy]::Default);"
+          "$w.Start();$t=0;"
+          "while($w.Status -ne 'Ready' -and $w.Permission -ne 'Denied' -and $t -lt 150){Start-Sleep -Milliseconds 100;$t++};"
+          "if($w.Permission -eq 'Denied'){exit 5};"
+          "$l=$w.Position.Location;if($l.IsUnknown){exit 6};"
+          "[string]::Format([Globalization.CultureInfo]::InvariantCulture,'{0},{1}',$l.Latitude,$l.Longitude)")
+    r = _ps_run(ps, 45)
+    if r.returncode == 5:
+        raise RuntimeError("Windows 沒有允許定位。請到「設定 > 隱私權與安全性 > 位置」開啟位置服務，並允許桌面應用程式存取位置。")
+    if r.returncode == 6:
+        raise RuntimeError("抓不到位置 (電腦可能沒有 Wi-Fi 或 GPS，或位置服務沒開)。請改用搜尋地區名稱。")
+    try:
+        lat, lon = (float(x) for x in r.stdout.decode("utf-8", "ignore").strip().splitlines()[-1].split(","))
+        return lat, lon
+    except Exception:
+        raise RuntimeError("定位失敗，請改用搜尋地區名稱。")
+
+
+class Net(QObject):
+    """背景執行緒做網路工作，結果用訊號送回主執行緒: res(標籤, ("ok", 結果) 或 ("err", 錯誤訊息))"""
+    res = Signal(str, object)
+
+    def run(self, tag, fn, *args):
+        def work():
+            try:
+                out = ("ok", fn(*args))
+            except Exception as e:
+                out = ("err", str(e) or e.__class__.__name__)
+            self.res.emit(tag, out)
+        threading.Thread(target=work, daemon=True).start()
+
+
+class WeatherDialog(QDialog):
+    """天氣與定位設定"""
+    def __init__(self, pl):
+        super().__init__(pl)
+        self.pl = pl
+        c = pl.cfg
+        self.setWindowTitle("天氣與定位")
+        self.resize(520, 560)
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("找地區 (城市、鄉鎮名都可以，中文英文皆可):"))
+        r = QHBoxLayout()
+        self.q = QLineEdit()
+        self.q.setPlaceholderText("例如 二崙、台北市、Tokyo")
+        self.q.returnPressed.connect(self.search)
+        r.addWidget(self.q, 1)
+        sb = QPushButton("🔍 搜尋")
+        sb.clicked.connect(self.search)
+        r.addWidget(sb)
+        v.addLayout(r)
+        self.results = QListWidget()
+        self.results.setMaximumHeight(150)
+        self.results.itemDoubleClicked.connect(lambda *_: self.choose())
+        v.addWidget(self.results)
+        r = QHBoxLayout()
+        cb = QPushButton("✔ 用選到的地區")
+        cb.clicked.connect(self.choose)
+        r.addWidget(cb)
+        lb = QPushButton("📍 自動定位 (Windows 定位服務)")
+        lb.clicked.connect(self.locate)
+        r.addWidget(lb)
+        v.addLayout(r)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setObjectName("sub")
+        v.addWidget(self.status)
+
+        v.addSpacing(8)
+        v.addWidget(QLabel("報時時唸的地區名稱 (可以自己改，例如改成 家裡、二崙鄉):"))
+        self.name = QLineEdit(c["weather_name"])
+        self.name.textChanged.connect(self._name_changed)
+        v.addWidget(self.name)
+        self.coord = QLabel("")
+        self.coord.setObjectName("sub")
+        v.addWidget(self.coord)
+        self.extra = QCheckBox("報氣溫時，也報天氣狀況與降雨機率 (例如「多雲，降雨機率百分之30」)")
+        self.extra.setChecked(c["chime_weather_extra"])
+        self.extra.toggled.connect(lambda on: c.__setitem__("chime_weather_extra", on))
+        v.addWidget(self.extra)
+        v.addStretch(1)
+        v.addWidget(link_label("天氣資料來源: ", "https://opendata.cwa.gov.tw/", "中央氣象署開放資料平臺"))
+        v.addWidget(link_label("國外地點備援: ", "https://open-meteo.com/", "Weather data by Open-Meteo.com"))
+        note = QLabel("隱私說明: 台灣的天氣是從你的 GitHub 倉庫讀取一份定時更新的資料，不會把座標送出去 (座標只在你的電腦上比對)；只有查國外地點時才會把座標送到 Open-Meteo；用線上女聲報時時，會把要唸的那句話 (時間、地區名稱、氣溫) 送到 Microsoft 的線上語音服務。座標只存在你自己的設定檔裡。")
+        note.setObjectName("sub")
+        note.setWordWrap(True)
+        v.addWidget(note)
+        r = QHBoxLayout()
+        tb = QPushButton("🔊 試聽播報")
+        tb.clicked.connect(lambda: pl._announce(test=True))
+        r.addWidget(tb)
+        r.addStretch(1)
+        cl = QPushButton("關閉")
+        cl.clicked.connect(self.accept)
+        r.addWidget(cl)
+        v.addLayout(r)
+        self._coord()
+
+    def _coord(self):
+        c = self.pl.cfg
+        self.coord.setText(f"目前座標: {c['weather_lat']:.3f}, {c['weather_lon']:.3f}" if c["weather_lat"] is not None else "還沒有設定地區")
+
+    def _name_changed(self, t):
+        self.pl.cfg["weather_name"] = t.strip()
+        self.pl._show_weather()
+
+    def search(self):
+        t = self.q.text().strip()
+        if not t:
+            return
+        self.status.setText("搜尋中...")
+        self.pl.net.run("geo", geocode, t)
+
+    def locate(self):
+        self.status.setText("定位中... (最多等 15 秒；第一次可能會跳出 Windows 的位置權限詢問)")
+        self.pl.net.run("loc", locate_windows)
+
+    def on_net(self, tag, out):
+        kind, val = out
+        if tag == "geo":
+            self.results.clear()
+            if kind == "err":
+                self.status.setText("⚠️ 搜尋失敗: " + val)
+                return
+            if not val:
+                self.status.setText("找不到這個地區，換個名字試試 (例如加上縣市名)。")
+                return
+            for r in val:
+                it = QListWidgetItem("　".join(x for x in (r["name"], r["admin"], r["country"]) if x))
+                it.setData(Qt.UserRole, r)
+                self.results.addItem(it)
+            self.results.setCurrentRow(0)
+            self.status.setText(f"找到 {len(val)} 個，請選一個 (雙擊或按「用選到的地區」)。")
+        elif tag == "loc":
+            if kind == "err":
+                self.status.setText("⚠️ " + val)
+                return
+            lat, lon = val
+            self._set_place(None, lat, lon)
+            self.status.setText("✅ 已定位。Windows 只提供座標、不提供地名，請在下方確認「報時時唸的地區名稱」。")
+            if not self.name.text().strip():
+                self.name.setFocus()
+
+    def choose(self):
+        it = self.results.currentItem()
+        if not it:
+            self.status.setText("請先搜尋並選一個地區。")
+            return
+        r = it.data(Qt.UserRole)
+        self._set_place(r["name"], r["lat"], r["lon"])
+        self.status.setText(f"✅ 已設定為 {r['name']}。")
+
+    def _set_place(self, name, lat, lon):
+        c = self.pl.cfg
+        c["weather_lat"], c["weather_lon"] = lat, lon
+        if name:
+            self.name.setText(name)
+            c["weather_name"] = name
+        save_cfg(c)
+        self._coord()
+        self.pl.weather = None
+        self.pl.refresh_weather()
+        self.pl._show_weather()
+
+
 class Hot(QObject):
     prev = Signal()
     toggle = Signal()
     next = Signal()
 
 
+EDGE_VOICES = {          # Edge 線上女聲 (需要網路；不是微軟正式開放的服務，有一天可能失效，失效時自動改用 Windows 內建女聲)
+    "曉臻 (台灣・線上)": "zh-TW-HsiaoChenNeural",
+    "曉雨 (台灣・線上)": "zh-TW-HsiaoYuNeural",
+    "曉曉 (中文・線上)": "zh-CN-XiaoxiaoNeural",
+    "曉伊 (中文・線上)": "zh-CN-XiaoyiNeural",
+}
+VOICE_AUTO = "自動 (優先用最好聽的女聲)"
+
+
+def edge_available():
+    try:
+        return importlib.util.find_spec("edge_tts") is not None
+    except Exception:
+        return False
+
+
+def _ps_run(ps, timeout=60):
+    flags = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW，不跳出黑視窗
+    ps = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + ps
+    return subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                          creationflags=flags, capture_output=True, timeout=timeout)
+
+
 class Speaker(QObject):
-    """語音報時: 呼叫 Windows 內建語音 (System.Speech)，不需安裝任何套件。
-    done(code): 0=成功  3=找不到中文語音  其他=失敗"""
+    """語音報時 (只用女聲)。Windows 內建語音 (System.Speech) 不需安裝套件；另可用 Edge 線上女聲 (edge-tts，要網路)。
+    done(code): 0=成功  3=找不到女聲  5=線上語音失敗、已改用內建女聲  其他=失敗"""
     done = Signal(int)
+    voices = Signal(list)
 
-    def speak(self, text):
-        threading.Thread(target=self._run, args=(text,), daemon=True).start()
+    def list_voices(self):
+        def run():
+            names = []
+            try:
+                r = _ps_run("Add-Type -AssemblyName System.Speech;"
+                            "(New-Object System.Speech.Synthesis.SpeechSynthesizer).GetInstalledVoices()|"
+                            "Where-Object{$_.Enabled -and $_.VoiceInfo.Gender -eq 'Female' -and $_.VoiceInfo.Culture.Name -like 'zh-*'}|"
+                            "ForEach-Object{$_.VoiceInfo.Name}", 30)
+                names = [x.strip() for x in r.stdout.decode("utf-8", "ignore").splitlines() if x.strip()]
+            except Exception:
+                pass
+            self.voices.emit(names)
+        threading.Thread(target=run, daemon=True).start()
 
-    def _run(self, text):
+    def speak(self, text, voice="", rate=0):
+        threading.Thread(target=self._run, args=(text, voice, rate), daemon=True).start()
+
+    def _edge(self, text, short, rate):
+        import asyncio, tempfile, edge_tts
+        fd, path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            async def go():
+                await edge_tts.Communicate(text, short, rate="%+d%%" % (rate * 10)).save(path)
+            asyncio.run(go())
+            if os.path.getsize(path) < 500:
+                raise RuntimeError("線上語音沒有回傳聲音")
+            snd = pygame.mixer.Sound(path)
+            ch = snd.play()
+            while ch is not None and ch.get_busy():
+                time.sleep(0.1)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _sapi(self, text, voice, rate):
+        want = (voice or "").replace("'", "''")
+        t = text.replace("'", "''")
         ps = (
             "Add-Type -AssemblyName System.Speech;"
             "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-            "$vs=$s.GetInstalledVoices()|Where-Object{$_.Enabled};"
-            "$v=$vs|Where-Object{$_.VoiceInfo.Culture.Name -eq 'zh-TW'}|Select-Object -First 1;"
+            "$vs=$s.GetInstalledVoices()|Where-Object{$_.Enabled -and $_.VoiceInfo.Gender -eq 'Female'};"
+            f"$v=$vs|Where-Object{{$_.VoiceInfo.Name -eq '{want}'}}|Select-Object -First 1;"
+            "if(-not $v){$v=$vs|Where-Object{$_.VoiceInfo.Culture.Name -eq 'zh-TW'}|Select-Object -First 1};"
             "if(-not $v){$v=$vs|Where-Object{$_.VoiceInfo.Culture.Name -like 'zh-*'}|Select-Object -First 1};"
             "if(-not $v){exit 3};"
-            "$s.SelectVoice($v.VoiceInfo.Name);$s.Volume=100;"
-            f"$s.Speak('{text}')"
+            f"$s.SelectVoice($v.VoiceInfo.Name);$s.Volume=100;$s.Rate={int(rate)};"
+            f"$s.Speak('{t}')"
         )
+        return _ps_run(ps).returncode
+
+    def _run(self, text, voice, rate):
         try:
-            flags = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW，不跳出黑視窗
-            r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-                               creationflags=flags, capture_output=True, timeout=60)
-            self.done.emit(r.returncode)
+            used_edge_fail = False
+            short = EDGE_VOICES.get(voice)
+            if short is None and (not voice or voice == VOICE_AUTO) and edge_available() and pygame is not None:
+                short = EDGE_VOICES["曉臻 (台灣・線上)"]
+            if short and edge_available() and pygame is not None:
+                try:
+                    self._edge(text, short, rate)
+                    self.done.emit(0)
+                    return
+                except Exception:
+                    used_edge_fail = True
+            code = self._sapi(text, "" if voice in EDGE_VOICES or voice == VOICE_AUTO else voice, rate)
+            self.done.emit(5 if (code == 0 and used_edge_fail) else code)
         except Exception:
             self.done.emit(-1)
 
@@ -1370,16 +2820,19 @@ class Player(QWidget):
         self.counted = self.paused = False
         self._wp_src = None
         self._wp_path = None
+        self._wp_prev, self._fade = None, 1.0              # 淡入淡出: 上一張背景 / 目前進度 (0~1)
+        self._fade_anim = QVariantAnimation(self)
+        self._fade_anim.setDuration(900)
+        self._fade_anim.valueChanged.connect(self._on_fade)
+        self._fade_anim.finished.connect(self._fade_done)
+        self._wp_list, self._wp_idx, self._next_slide = [], -1, 0.0
+        self._dl_dlg = None
         self._bg_cache = None
 
         self.setWindowTitle(f"卡車播放器 v{VERSION}")
         self.resize(1280, 760)
         self.setMinimumSize(900, 520)
         self.setAttribute(Qt.WA_StyledBackground, False)
-        self.setWindowIcon(app_icon())
-        self.single = None              # 單一執行個體的 QLocalServer (由 main 設定)
-        self._tray_hinted = False       # 第一次收進系統匣時，跳一次提示
-        self._tray_tip = ""
 
         if pygame is None:
             QMessageBox.critical(self, "缺少 pygame", "自動安裝失敗。\n" + (LAST_ERR or ""))
@@ -1388,9 +2841,9 @@ class Player(QWidget):
         pygame.mixer.music.set_volume(self.cfg["volume"] / 100)
 
         self._build()
-        self._make_tray()
         self._apply_folders_open()
         self._apply_drawer(animate=False)
+        self._slideshow_changed()
         self.apply_theme()
         self._load_folders()
         self.refresh_tracks()
@@ -1402,6 +2855,9 @@ class Player(QWidget):
         self.timer.start(500)
         self._clock_tick()
         self._hotkeys()
+        self._quitting = False
+        self.setWindowIcon(app_icon())
+        self._setup_tray()
         self.updater = Updater()
         self.updater.result.connect(self._update_result)
         self._upd_dlg = None
@@ -1429,10 +2885,13 @@ class Player(QWidget):
         tb.setContentsMargins(14, 4, 6, 4)
         self.title_lbl = QLabel("卡車播放器")
         tb.addWidget(self.title_lbl, 1)
-        for txt, fn in (("─", self.showMinimized), ("✕", self.close)):
+        for txt, fn, tip in (("▼", self._to_tray_or_min, "縮到系統匣 (右下角圖示盒，音樂繼續播)"),
+                             ("─", self._min_taskbar, "縮到工作列"),
+                             ("✕", self.close, "關閉")):
             b = QPushButton(txt)
             b.setObjectName("winbtn")
             b.setFixedSize(40, 26)
+            b.setToolTip(tip)
             b.clicked.connect(fn)
             tb.addWidget(b)
         self.titlebar.hide()
@@ -1459,6 +2918,9 @@ class Player(QWidget):
         hb.addWidget(b1)
         hb.addWidget(b2)
         lv.addLayout(hb)
+        b6 = QPushButton("⬇ 下載音樂…")
+        b6.clicked.connect(self.open_download)
+        lv.addWidget(b6)
         b4 = QPushButton("🔍 找重複歌曲…")
         b4.clicked.connect(self.find_dups)
         lv.addWidget(b4)
@@ -1518,17 +2980,23 @@ class Player(QWidget):
         self.theme_cb.setCurrentText(self.cfg["theme"])
         self.theme_cb.currentTextChanged.connect(self._theme_changed)
         r2.addWidget(self.theme_cb)
-        bw, bc = QPushButton("選擇桌布…"), QPushButton("清除桌布")
-        bw.clicked.connect(self.pick_wallpaper)
-        bc.clicked.connect(self.clear_wallpaper)
-        r2.addWidget(bw)
-        r2.addWidget(bc)
+        bwp = QPushButton("🖼 桌布 ▾")
+        bwp.setToolTip("選單張桌布 / 清除桌布 / 桌布幻燈片")
+        wm = QMenu(bwp)
+        wm.addAction("選擇單張桌布…", self.pick_wallpaper)
+        wm.addAction("桌布幻燈片…  (資料夾輪流換圖)", self.open_slideshow)
+        wm.addSeparator()
+        wm.addAction("清除桌布", self.clear_wallpaper)
+        bwp.setMenu(wm)
+        self._wp_menu = wm
+        r2.addWidget(bwp)
         r2.addSpacing(8)
-        r2.addWidget(QLabel("面板深度:"))
+        r2.addWidget(QLabel("深度"))
         self.alpha_sl = QSlider(Qt.Horizontal)
         self.alpha_sl.setRange(0, 100)
         self.alpha_sl.setValue(self.cfg["panel_alpha"])
-        self.alpha_sl.setFixedWidth(130)
+        self.alpha_sl.setMinimumWidth(70)
+        self.alpha_sl.setMaximumWidth(130)
         self.alpha_sl.valueChanged.connect(self._alpha_changed)
         r2.addWidget(self.alpha_sl)
         r2.addStretch(1)
@@ -1647,74 +3115,6 @@ class Player(QWidget):
         self.pop.setFixedSize(64, 210)
         self._update_vol_icon(self.cfg["volume"])
 
-    # ---------------- 系統匣 (右下角小圖示) ----------------
-    def _make_tray(self):
-        self.tray_ok = QSystemTrayIcon.isSystemTrayAvailable()
-        self.tray = QSystemTrayIcon(app_icon(), self)
-        menu = QMenu()
-        self._tray_menu = menu                      # 要留著參照，不然會被回收
-        for txt, fn in (("顯示視窗", self._show_from_tray), (None, None), ("◀◀ 上一首", self.prev), ("▶ / ❚❚ 播放暫停", self.toggle),
-                        ("▶▶ 下一首", self.next), (None, None)):
-            if txt is None:
-                menu.addSeparator()
-                continue
-            act = QAction(txt, self)
-            act.triggered.connect(fn)
-            menu.addAction(act)
-        self.tray_min_act = QAction("最小化時收進系統匣", self)
-        self.tray_min_act.setCheckable(True)
-        self.tray_min_act.setChecked(self.cfg["tray_min"])
-        self.tray_min_act.toggled.connect(lambda on: (self.cfg.__setitem__("tray_min", on), save_cfg(self.cfg)))
-        menu.addAction(self.tray_min_act)
-        menu.addSeparator()
-        quit_act = QAction("結束", self)
-        quit_act.triggered.connect(self._quit)
-        menu.addAction(quit_act)
-        self.tray.setContextMenu(menu)
-        self.tray.setToolTip("卡車播放器")
-        self.tray.activated.connect(self._tray_clicked)
-        if self.tray_ok:
-            self.tray.show()
-
-    def _tray_clicked(self, reason):
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._show_from_tray()
-
-    def changeEvent(self, e):
-        if e.type() == QEvent.WindowStateChange and self.isMinimized() and getattr(self, "tray_ok", False) and self.cfg["tray_min"]:
-            QTimer.singleShot(0, self._hide_to_tray)      # 等這一輪事件處理完再隱藏，比較穩
-        super().changeEvent(e)
-
-    def _hide_to_tray(self):
-        self.hide()
-        if not self._tray_hinted:
-            self._tray_hinted = True
-            self.tray.showMessage("卡車播放器", "已收進系統匣，音樂會繼續播放。\n點圖示可以還原；在圖示上按右鍵可以結束，或改回一般最小化。",
-                                  self.tray.icon(), 6000)
-
-    def _show_from_tray(self):
-        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-
-    def _on_single(self):
-        """又有人想開第二個播放器: 把這個叫出來就好"""
-        if self.single:
-            s = self.single.nextPendingConnection()
-            if s:
-                s.readAll()
-                s.disconnectFromServer()
-        self._show_from_tray()
-
-    def _release_single(self):
-        if self.single:
-            self.single.close()
-            self.single = None
-
-    def _quit(self):
-        self.close()
-
     # ---------------- 外觀 ----------------
     def apply_theme(self):
         th = THEMES[self.cfg["theme"]]
@@ -1729,6 +3129,7 @@ class Player(QWidget):
         QLabel {{ background: transparent; }}
         QPushButton {{ background-color: rgba(255,255,255,30); border: none; border-radius: 8px; padding: 7px 14px; }}
         QPushButton:hover {{ background-color: {acc}; color: #ffffff; }}
+        QPushButton::menu-indicator {{ image: none; width: 0px; }}
         QPushButton#winbtn {{ padding: 0; border-radius: 6px; }}
         QLineEdit, QComboBox {{ background-color: rgba(0,0,0,70); border: 1px solid rgba(255,255,255,40); border-radius: 8px; padding: 5px 8px; }}
         QComboBox::drop-down {{ border: none; width: 22px; }}
@@ -1754,11 +3155,15 @@ class Player(QWidget):
         QFrame#volpop {{ background-color: rgb({min(255,r+22)},{min(255,g+22)},{min(255,b+22)}); border: 1px solid rgba(255,255,255,70); border-radius: 12px; }}
         QPushButton#volbtn {{ font-size: 18px; padding: 0; }}
         QLabel#sub {{ color: {sub}; }}
+        QProgressBar {{ background: rgba(255,255,255,40); border: none; border-radius: 4px; max-height: 8px; }}
+        QProgressBar::chunk {{ background: {acc}; border-radius: 4px; }}
         QDialog {{ background-color: rgb({min(255,r+22)},{min(255,g+22)},{min(255,b+22)}); }}
         QTreeWidget::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid {sub}; background: rgba(0,0,0,60); }}
         QTreeWidget::indicator:checked {{ background: {acc}; border-color: {acc}; }}
         QLabel#dtitle {{ font-size: 16px; font-weight: bold; }}
         QLabel#bigclock {{ font-size: 36px; font-weight: bold; }}
+        QLabel#wxplace {{ font-size: 15px; font-weight: bold; }}
+        QLabel#wxnow {{ font-size: 24px; font-weight: bold; }}
         QPushButton#clockbtn[rep="1"] {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#shufbtn:checked {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#foldbtn {{ font-size: 18px; padding: 0; }}
@@ -1785,16 +3190,26 @@ class Player(QWidget):
         save_cfg(self.cfg)
         self.apply_theme()
 
+    def _on_fade(self, v):
+        self._fade = float(v)
+        self.update()
+
+    def _fade_done(self):
+        self._fade, self._wp_prev = 1.0, None
+        self.update()
+
     def pick_wallpaper(self):
         f, _ = QFileDialog.getOpenFileName(self, "選擇桌布圖片", "", "圖片 (*.jpg *.jpeg *.png *.bmp *.webp);;全部 (*.*)")
         if f:
             self.cfg["wallpaper"] = f
+            self.cfg["wp_slide"] = False                   # 自己挑了單張，就停掉幻燈片
             save_cfg(self.cfg)
             self._bg_cache = None
             self.update()
 
     def clear_wallpaper(self):
         self.cfg["wallpaper"] = ""
+        self.cfg["wp_slide"] = False
         save_cfg(self.cfg)
         self._bg_cache = None
         self.update()
@@ -1829,7 +3244,14 @@ class Player(QWidget):
 
     def paintEvent(self, e):
         p = QPainter(self)
-        p.drawImage(0, 0, self._background())
+        bg = self._background()
+        if self._wp_prev is not None and self._fade < 1.0 and self._wp_prev.size() == bg.size():
+            p.drawImage(0, 0, self._wp_prev)               # 淡入淡出: 先畫舊圖，再用漸增的不透明度疊上新圖
+            p.setOpacity(self._fade)
+            p.drawImage(0, 0, bg)
+            p.setOpacity(1.0)
+        else:
+            p.drawImage(0, 0, bg)
         if self.cfg.get("wallpaper"):
             p.fillRect(self.rect(), QColor(0, 0, 0, 40))   # 輕微壓暗，讓字清楚
         p.end()
@@ -1857,17 +3279,18 @@ class Player(QWidget):
         self.folder_list.blockSignals(True)
         self.folder_list.clear()
         for f, on in self.cfg["folders"].items():
-            it = QListWidgetItem(f)
+            it = QListWidgetItem(f + ('   ⚠ 路徑損毀，請移除後重新加入' if '\ufffd' in f else ''))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if on else Qt.Unchecked)
             it.setToolTip(f)
+            it.setData(Qt.UserRole, f)          # 真正的路徑 (畫面上的文字可能多了警告)
             self.folder_list.addItem(it)
         self.folder_list.blockSignals(False)
 
     def _folder_toggled(self, _it):
         for i in range(self.folder_list.count()):
             it = self.folder_list.item(i)
-            self.cfg["folders"][it.text()] = it.checkState() == Qt.Checked
+            self.cfg["folders"][it.data(Qt.UserRole) or it.text()] = it.checkState() == Qt.Checked
         save_cfg(self.cfg)
         self.refresh_tracks()
 
@@ -1926,8 +3349,6 @@ class Player(QWidget):
         # 啟動時自動檢查: 有新版才打擾，失敗就靜靜略過
         if res.get("ok") and res["version"] > VERSION and res["version"] != self.cfg["update_skip"]:
             self.toast.show_for(res)          # 左下角小提示框 (按「是」才更新)
-            if not self.isVisible() and self.tray_ok:      # 視窗收在系統匣時，改用氣泡通知
-                self.tray.showMessage("卡車播放器", f"發現新版本 v{res['version']}，點圖示打開視窗就可以更新。", self.tray.icon(), 6000)
 
     def install_update(self, res, parent, quiet=False):
         self.toast.hide()
@@ -1939,12 +3360,92 @@ class Player(QWidget):
 
     def _restart(self):
         save_cfg(self.cfg)
-        self._release_single()            # 先放掉「單一執行個體」的占用，不然新開的那個會以為已經有人在跑而直接結束
         try:
-            spawn_self()
+            if FROZEN:
+                spawn_clean(SCRIPT)
+            else:
+                subprocess.Popen([sys.executable, SCRIPT])
         except Exception:
             pass
+        self._quitting = True
         self.close()
+
+    # ---------------- 下載音樂 ----------------
+    def open_download(self):
+        if self._dl_dlg is None:
+            self._dl_dlg = DownloadDialog(self)
+        self._dl_dlg.show()
+        self._dl_dlg.raise_()
+        self._dl_dlg.activateWindow()
+        QTimer.singleShot(300, self._dl_dlg.ensure_tools)      # 缺 yt-dlp / ffmpeg 就自動下載
+
+    def after_download(self, path):
+        """下載完成: 資料夾還沒在清單裡就加進去 (已被勾選的上層資料夾涵蓋就不用)，然後重新掃描"""
+        path = os.path.normpath(path)
+        key = os.path.normcase(path)
+        covered = any(on and (key == os.path.normcase(f) or key.startswith(os.path.normcase(f) + os.sep))
+                      for f, on in self.cfg["folders"].items())
+        if not covered:
+            self.cfg["folders"][path] = True
+            save_cfg(self.cfg)
+            self._load_folders()
+        self.refresh_tracks()
+
+    # ---------------- 桌布幻燈片 ----------------
+    def open_slideshow(self):
+        SlideshowDialog(self).exec()
+
+    def set_wallpaper(self, path, fade=True):
+        prev = self._background() if (fade and self.cfg["wp_fade"] and self.isVisible()) else None
+        self.cfg["wallpaper"] = path
+        self._bg_cache = None
+        self._fade_anim.stop()
+        if prev is not None:
+            self._wp_prev = prev
+            self._fade = 0.0
+            self._fade_anim.setStartValue(0.0)
+            self._fade_anim.setEndValue(1.0)
+            self._fade_anim.start()
+        else:
+            self._wp_prev, self._fade = None, 1.0
+        self.update()
+
+    def _slideshow_changed(self):
+        """設定改變或啟動時: 重新掃描圖片、重設計時"""
+        d = self.cfg["wp_dir"]
+        if self.cfg["wp_source"] == "picked":
+            self._wp_list = [p for p in self.cfg["wp_files"] if os.path.isfile(p)]     # 照使用者排的順序
+        else:
+            self._wp_list = scan_images(d) if d and os.path.isdir(d) else []
+        cur = self.cfg.get("wallpaper", "")
+        self._wp_idx = self._wp_list.index(cur) if cur in self._wp_list else -1
+        self._reset_slide_timer()
+
+    def _reset_slide_timer(self):
+        sec = WP_INTERVAL.get(self.cfg["wp_mode"])
+        self._next_slide = time.time() + sec if sec else 0.0
+
+    def next_wallpaper(self):
+        if not self._wp_list:
+            return False
+        n = len(self._wp_list)
+        if self.cfg["wp_shuffle"] and n > 1:
+            i = random.choice([k for k in range(n) if k != self._wp_idx])
+        else:
+            i = (self._wp_idx + 1) % n
+        self._wp_idx = i
+        self.set_wallpaper(self._wp_list[i])
+        self._reset_slide_timer()
+        save_cfg(self.cfg)
+        return True
+
+    def _slide_tick(self):
+        if self.cfg["wp_slide"] and self._next_slide and time.time() >= self._next_slide:
+            self.next_wallpaper()
+
+    def _slide_on_song(self):
+        if self.cfg["wp_slide"] and self.cfg["wp_mode"] == WP_MODES[0]:
+            self.next_wallpaper()
 
     def open_hidden(self):
         HiddenDialog(self).exec()
@@ -2016,6 +3517,9 @@ class Player(QWidget):
         self.seek.setValue(0)
         self.seek.blockSignals(False)
         self.now_lbl.setText("正在播放: " + os.path.splitext(os.path.basename(path))[0])
+        if getattr(self, "tray", None):
+            self.tray.setToolTip(os.path.splitext(os.path.basename(path))[0][:60])
+        self._slide_on_song()
         it = self.tree.topLevelItem(idx)
         if it:
             self.tree.setCurrentItem(it)
@@ -2027,8 +3531,19 @@ class Player(QWidget):
 
     def _build_drawer(self):
         inner = self._panel()
-        v = QVBoxLayout(inner)
-        v.setContentsMargins(14, 12, 14, 12)
+        outer = QVBoxLayout(inner)
+        outer.setContentsMargins(0, 4, 0, 4)
+        scroll = QScrollArea()                       # 內容變多時可以上下捲動，不會把視窗最小高度撐大
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;} QScrollArea>QWidget>QWidget{background:transparent;}")
+        content = QWidget()
+        content.setObjectName("dcontent")
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        v = QVBoxLayout(content)
+        v.setContentsMargins(14, 8, 14, 8)
         v.setSpacing(6)
         t = QLabel("定時 / 報時")
         t.setObjectName("dtitle")
@@ -2043,6 +3558,33 @@ class Player(QWidget):
         self.date_lbl.setObjectName("sub")
         v.addWidget(self.date_lbl)
         v.addSpacing(8)
+
+        # --- 天氣 ---
+        v.addWidget(self._sec("天氣"))
+        self.wx_place = QLabel("📍 尚未設定地區")
+        self.wx_place.setObjectName("wxplace")
+        self.wx_now = QLabel("")
+        self.wx_now.setObjectName("wxnow")
+        self.wx_now.setTextFormat(Qt.RichText)
+        self.wx_range = QLabel("")
+        self.wx_range.setWordWrap(True)
+        self.wx_days = QLabel("")
+        self.wx_days.setObjectName("sub")
+        for w in (self.wx_place, self.wx_now, self.wx_range, self.wx_days):
+            v.addWidget(w)
+        rw = QHBoxLayout()
+        wb = QPushButton("☁ 天氣設定…")
+        wb.clicked.connect(self.open_weather)
+        rf = QPushButton("⟳")
+        rf.setFixedWidth(40)
+        rf.setToolTip("立即更新天氣")
+        rf.clicked.connect(lambda: (setattr(self, "_wx_err", ""), self.refresh_weather(True)))
+        rw.addWidget(wb, 1)
+        rw.addWidget(rf)
+        v.addLayout(rw)
+        v.addWidget(link_label("", "https://opendata.cwa.gov.tw/", "資料: 中央氣象署"))
+        v.addSpacing(8)
+
 
         # --- 定時停止 ---
         v.addWidget(self._sec("定時停止播放"))
@@ -2068,6 +3610,30 @@ class Player(QWidget):
         for cb, key in ((self.cb_hour, "chime_hour"), (self.cb_half, "chime_half"), (self.cb_ampm, "chime_ampm")):
             cb.toggled.connect(lambda on, k=key: self.cfg.__setitem__(k, on))
             v.addWidget(cb)
+        self.cb_wx = QCheckBox("報時時一併報氣溫")
+        self.cb_wx.setChecked(self.cfg["chime_weather"])
+        self.cb_wx.toggled.connect(lambda on: self.cfg.__setitem__("chime_weather", on))
+        v.addWidget(self.cb_wx)
+        v.addWidget(self._sec("聲音 (只列女聲)"))
+        self.voice_cb = QComboBox()
+        self.voice_cb.addItem(VOICE_AUTO)
+        if edge_available():
+            for k in EDGE_VOICES:
+                self.voice_cb.addItem(k)
+        self.voice_cb.currentTextChanged.connect(lambda t: self.cfg.__setitem__("voice", "" if t == VOICE_AUTO else t))
+        v.addWidget(self.voice_cb)
+        rr = QHBoxLayout()
+        rr.addWidget(QLabel("語速"))
+        self.rate_sl = QSlider(Qt.Horizontal)
+        self.rate_sl.setRange(-5, 5)
+        self.rate_sl.setValue(int(self.cfg["voice_rate"]))
+        self.rate_lbl = QLabel("")
+        self.rate_lbl.setObjectName("sub")
+        self.rate_sl.valueChanged.connect(self._rate_changed)
+        rr.addWidget(self.rate_sl, 1)
+        rr.addWidget(self.rate_lbl)
+        v.addLayout(rr)
+        self._rate_changed(self.rate_sl.value())
         b = QPushButton("🔊 試聽目前時間")
         b.clicked.connect(lambda: self._announce(test=True))
         v.addWidget(b)
@@ -2079,11 +3645,34 @@ class Player(QWidget):
 
         self.speaker = Speaker()
         self.speaker.done.connect(self._speak_done)
+        self.speaker.voices.connect(self._voices_loaded)
+        self.speaker.list_voices()
         self._speaking = False
         self._duck_restore = None
         now = datetime.datetime.now()
         self._last_chime = (now.hour, now.minute)     # 啟動當下那一分鐘不報
+        self.net = Net()
+        self.net.res.connect(self._net_result)
+        self.weather, self._wx_busy, self._wx_err, self._wx_dlg = None, False, "", None
+        self._wx_next = time.time() + 3               # 開啟後幾秒就先抓一次天氣
+        self._show_weather()
         return inner
+
+    def _rate_changed(self, val):
+        self.cfg["voice_rate"] = int(val)
+        self.rate_lbl.setText("標準" if val == 0 else (f"快 {val}" if val > 0 else f"慢 {-val}"))
+
+    def _voices_loaded(self, names):
+        """Windows 內建女聲偵測完成: 加進選單，並選回上次用的聲音。"""
+        for n in names:
+            if self.voice_cb.findText(n) < 0:
+                self.voice_cb.addItem(n)
+        cur = self.cfg.get("voice", "")
+        i = self.voice_cb.findText(cur) if cur else 0
+        self.voice_cb.blockSignals(True)
+        self.voice_cb.setCurrentIndex(max(i, 0))
+        self.voice_cb.blockSignals(False)
+        self._have_sapi_female = bool(names)
 
     def _sec(self, txt):
         l = QLabel(txt)
@@ -2176,6 +3765,8 @@ class Player(QWidget):
 
     # ---- 時鐘 / 報時 ----
     def _clock_tick(self):
+        self._slide_tick()
+        self._wx_tick()
         dt = datetime.datetime.now()
         self.clock_btn.setText("⏱ " + dt.strftime("%H:%M"))
         self.big_clock.setText(dt.strftime("%H:%M:%S"))
@@ -2204,10 +3795,10 @@ class Player(QWidget):
             h = dt.hour
             pre = "凌晨" if h < 5 else "上午" if h < 12 else "中午" if h == 12 else "下午" if h < 18 else "晚上"
         if dt.minute == 0:
-            return f"現在時間{pre}{h12}點"
+            return f"現在是{pre}{h12}點"
         if dt.minute == 30:
-            return f"現在時間{pre}{h12}點半"
-        return f"現在時間{pre}{h12}點{dt.minute}分"        # 只有「試聽」會走到這裡
+            return f"現在是{pre}{h12}點半"
+        return f"現在是{pre}{h12}點{dt.minute}分"        # 只有「試聽」會走到這裡
 
     def _announce(self, test=False):
         if self._speaking:
@@ -2218,9 +3809,15 @@ class Player(QWidget):
             pygame.mixer.music.set_volume(self.cfg["volume"] / 100 * 0.25)
         except Exception:
             pass
-        text = self._time_text(datetime.datetime.now())
-        self.speak_lbl.setText("播報: " + text)
-        self.speaker.speak(text)
+        text = self._time_text(datetime.datetime.now()) + self._weather_phrase()
+        note = ""
+        if self.cfg["chime_weather"] and not self._weather_phrase():
+            if not (self.cfg["weather_name"] or "").strip():
+                note = "\n(還沒設定地區名稱，所以只報時間)" if self._has_place() else "\n(還沒設定地區，所以只報時間；可按「☁ 天氣設定」)"
+            elif not self.weather:
+                note = "\n(天氣還沒讀到，這次只報時間)"
+        self.speak_lbl.setText("播報: " + text + note)
+        self.speaker.speak(text, self.cfg.get("voice", ""), int(self.cfg.get("voice_rate", 0)))
 
     def _speak_done(self, code):
         self._speaking = False
@@ -2228,10 +3825,109 @@ class Player(QWidget):
             pygame.mixer.music.set_volume(self.cfg["volume"] / 100)
         except Exception:
             pass
-        if code == 3:
-            self.speak_lbl.setText("找不到中文語音。請到 Windows 設定 > 時間與語言 > 語音，安裝「中文(台灣)」語音。")
+        if code == 5:
+            self.speak_lbl.setText("線上女聲連不上，這次改用 Windows 內建女聲。")
+        elif code == 3:
+            self.speak_lbl.setText("找不到中文女聲。請到 Windows 設定 > 時間與語言 > 語音，安裝「中文(台灣)」語音；或安裝 edge-tts 使用線上女聲。")
         elif code != 0:
             self.speak_lbl.setText("語音播報失敗 (需要 Windows 內建 PowerShell 與語音功能)。")
+
+    # ---------------- 天氣 ----------------
+    def open_weather(self):
+        self._wx_dlg = WeatherDialog(self)
+        self._wx_dlg.exec()
+        self._wx_dlg = None
+
+    def _net_result(self, tag, out):
+        if tag == "wx":
+            self._weather_done(out)
+        elif self._wx_dlg is not None:
+            self._wx_dlg.on_net(tag, out)
+
+    def _has_place(self):
+        return self.cfg["weather_lat"] is not None and self.cfg["weather_lon"] is not None
+
+    def refresh_weather(self, force=False):
+        if not self._has_place():
+            self._show_weather()
+            return
+        if self._wx_busy:
+            return
+        self._wx_busy = True
+        self.net.run("wx", fetch_weather, float(self.cfg["weather_lat"]), float(self.cfg["weather_lon"]))
+
+    def _weather_done(self, out):
+        self._wx_busy = False
+        kind, val = out
+        if kind == "ok":
+            self.weather, self._wx_err = val, ""
+            self._wx_next = time.time() + 1800          # 每 30 分鐘更新一次
+        else:
+            self._wx_err = val
+            self._wx_next = time.time() + 300           # 失敗: 5 分鐘後再試
+        self._show_weather()
+
+    def _wx_tick(self):
+        if self._has_place() and not self._wx_busy and time.time() >= self._wx_next:
+            self._wx_next = time.time() + 60            # 先擋一下，避免重複觸發；結果回來會重設
+            self.refresh_weather()
+
+    def _show_weather(self):
+        name = (self.cfg["weather_name"] or "").strip()
+        if not self._has_place():
+            self.wx_place.setText("📍 尚未設定地區")
+            self.wx_now.setText("")
+            self.wx_range.setText("按下面「☁ 天氣設定」選擇地區")
+            self.wx_days.setText("")
+            return
+        self.wx_place.setText("📍 " + (name or "(未命名地區)"))
+        wx = self.weather
+        if not wx:
+            self.wx_now.setText("")
+            self.wx_range.setText(("⚠️ 讀取失敗: " + self._wx_err + "\n稍後會自動重試") if self._wx_err else "讀取天氣中...")
+            self.wx_days.setText("")
+            return
+
+        def deg(x):
+            return "?" if x is None else f"{round(x)}°"
+        d0 = wx["days"][0]
+        t = wx.get("temp")
+        self.wx_now.setText(f"{wx_icon(wx.get('code'))} {('?' if t is None else round(t))}°C"
+                            f"<br><span style='font-size:13px; font-weight:normal'>{wx.get('text') or wx_text(wx.get('code'))}</span>")
+        rng = f"今天 {deg(d0['tmin'])} ~ {deg(d0['tmax'])}"
+        if d0.get("pop") is not None:
+            rng += f"　降雨機率 {round(d0['pop'])}%"
+        self.wx_range.setText(rng)
+        names = ("今天", "明天", "後天")
+        self.wx_days.setText("\n".join(
+            f"{names[i]} {deg(d['tmin'])}~{deg(d['tmax'])}　{wx_icon(d['code'])} {d.get('text') or wx_text(d['code'])}"
+            for i, d in enumerate(wx["days"][1:3], start=1)))
+
+    @staticmethod
+    def _deg_words(n):
+        return f"零下{-n}度" if n < 0 else f"{n}度"
+
+    def _weather_phrase(self):
+        """報時後面接的氣溫那一句，例如「，二崙鄉今天氣溫22度到28度」。沒設定地區、或沒讀到天氣就回傳空字串。"""
+        if not self.cfg["chime_weather"]:
+            return ""
+        wx, name = self.weather, (self.cfg["weather_name"] or "").strip()
+        if not wx or not name or time.time() - wx["ts"] > 7200:
+            return ""
+        d = wx["days"][0]
+        if d["tmin"] is not None and d["tmax"] is not None:
+            lo, hi = round(d["tmin"]), round(d["tmax"])
+            rng = self._deg_words(hi) if lo == hi else f"{self._deg_words(lo)}到{self._deg_words(hi)}"
+        elif wx.get("temp") is not None:
+            rng = self._deg_words(round(wx["temp"]))
+        else:
+            return ""
+        s = f"，{name}今天氣溫{rng}"
+        if self.cfg["chime_weather_extra"]:
+            s += f"，{d.get('text') or wx_text(d['code'])}"
+            if d.get("pop") is not None and d["pop"] >= 20:
+                s += f"，降雨機率百分之{round(d['pop'])}"
+        return s
 
     def _toggle_folders(self):
         self.cfg["folders_open"] = not self.cfg["folders_open"]
@@ -2382,13 +4078,6 @@ class Player(QWidget):
                 self._auto_next()
         self.last_tick = now
         self._clock_tick()
-        tip = "卡車播放器"
-        if self.cur:
-            tip += ("  (暫停) " if self.paused else "  ▶ ") + os.path.splitext(os.path.basename(self.cur[1]))[0]
-        tip = tip[:120]                   # Windows 提示文字最長約 127 字
-        if tip != self._tray_tip:
-            self._tray_tip = tip
-            self.tray.setToolTip(tip)
         if not self.seek.dragging:
             self.seek.blockSignals(True)
             if self.cur:
@@ -2413,11 +4102,77 @@ class Player(QWidget):
         except Exception:
             pass
 
+    # ---------------- 系統匣 (最小化後收進右下角的圖示盒) ----------------
+    def _setup_tray(self):
+        self._quitting = getattr(self, "_quitting", False)
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        t = QSystemTrayIcon(app_icon(), self)
+        t.setToolTip(APP_NAME)
+        m = QMenu()
+        m.addAction("顯示播放器", self._tray_show)
+        m.addSeparator()
+        m.addAction("⏮ 上一首", self.prev)
+        m.addAction("⏯ 播放 / 暫停", self.toggle)
+        m.addAction("⏭ 下一首", self.next)
+        m.addSeparator()
+        self._act_c2t = QAction("按 ✕ 時縮到系統匣 (不關閉)", m)
+        self._act_c2t.setCheckable(True)
+        self._act_c2t.setChecked(bool(self.cfg["close_to_tray"]))
+        self._act_c2t.toggled.connect(lambda on: self.cfg.__setitem__("close_to_tray", on))
+        m.addAction(self._act_c2t)
+        m.addAction("結束", self._tray_quit)
+        t.setContextMenu(m)
+        t.activated.connect(lambda r: self._tray_show() if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+        t.show()
+        self.tray, self._tray_menu = t, m
+
+    def _tray_show(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_quit(self):
+        self._quitting = True
+        self.close()
+
+    def _min_taskbar(self):
+        """標題列的「─」: 一般縮到工作列 (不進系統匣)。"""
+        self._skip_tray = True
+        self.showMinimized()
+        QTimer.singleShot(800, lambda: setattr(self, "_skip_tray", False))
+
+    def _to_tray_or_min(self):
+        """標題列的「▼」: 直接縮到系統匣；這台電腦沒有系統匣就退回一般最小化。"""
+        if getattr(self, "tray", None):
+            self._to_tray()
+        else:
+            self._min_taskbar()
+
+    def _to_tray(self):
+        if not self.tray:
+            return
+        self.hide()
+        if not self.cfg["tray_tip_shown"]:
+            self.cfg["tray_tip_shown"] = True
+            self.tray.showMessage(APP_NAME, "播放器縮到右下角的圖示了，音樂繼續播放。點一下圖示就能叫出來。", QSystemTrayIcon.Information, 5000)
+
+    def changeEvent(self, e):
+        if e.type() == e.Type.WindowStateChange and self.isMinimized() and getattr(self, "tray", None) and not self._quitting and not getattr(self, "_skip_tray", False):
+            QTimer.singleShot(0, self._to_tray)
+        super().changeEvent(e)
+
     def closeEvent(self, e):
+        if getattr(self, "tray", None) and self.cfg["close_to_tray"] and not self._quitting:
+            e.ignore()
+            self._to_tray()
+            return
+        self._quitting = True
         save_cfg(self.cfg)
-        self._release_single()
         try:
-            self.tray.hide()              # 不隱藏的話，程式結束後系統匣會殘留一個死掉的圖示
+            if self.tray:
+                self.tray.hide()
         except Exception:
             pass
         try:
@@ -2425,25 +4180,20 @@ class Player(QWidget):
         except Exception:
             pass
         super().closeEvent(e)
-        QApplication.instance().quit()    # 視窗可以收在系統匣不結束程式，所以關閉視窗時要明確結束
+        QApplication.quit()
 
 
 if __name__ == "__main__":
-    if FROZEN:
-        cleanup_old_files()
-    if os.name == "nt":
-        try:    # 讓工作列用我們自己的播放鍵圖示，而不是 Python 的
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TruckPlayer.App")
-        except Exception:
-            pass
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TruckPlayer.App")     # 工作列用自己的播放鍵圖示
+    except Exception:
+        pass
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)  # 視窗收進系統匣時不要結束程式
     app.setWindowIcon(app_icon())
-    srv = single_instance()
-    if srv is None:                       # 已經有一個在跑了，剛剛已經請它把視窗叫出來
+    app.setQuitOnLastWindowClosed(False)         # 縮到系統匣時不要因為視窗隱藏就結束
+    cleanup_old()
+    if install_self_if_needed():
         sys.exit(0)
     w = Player()
-    w.single = srv
-    srv.newConnection.connect(w._on_single)
     w.show()
     sys.exit(app.exec())

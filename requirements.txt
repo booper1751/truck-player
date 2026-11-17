@@ -1,0 +1,6 @@
+# 打包成 EXE 時要一起包進去的套件。以後多用了新套件，只要在這裡加一行，打包腳本不用改。
+PySide6-Essentials
+pygame
+mutagen
+keyboard
+edge-tts
