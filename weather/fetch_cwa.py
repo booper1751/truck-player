@@ -86,7 +86,7 @@ def parse_forecast(js):
             def at(el, key="parameterName"):
                 arr = els.get(el, [])
                 return ((arr[i].get("parameter") or {}).get(key)) if i < len(arr) else None
-            periods.append({"s": w.get("startTime", ""), "text": (w.get("parameter") or {}).get("parameterName", ""),
+            periods.append({"s": w.get("startTime", ""), "e": w.get("endTime", ""), "text": (w.get("parameter") or {}).get("parameterName", ""),
                             "pop": num(at("PoP")), "min": num(at("MinT")), "max": num(at("MaxT"))})
         days = {}
         for p in periods:
@@ -101,7 +101,9 @@ def parse_forecast(js):
             res.append({"date": date, "tmin": min(mins) if mins else None, "tmax": max(maxs) if maxs else None,
                         "pop": max(pops) if pops else None, "text": pick["text"], "code": wx_code(pick["text"])})
         if name and res:
-            out[name] = {"days": res[:3]}
+            plist = [{"s": q["s"], "e": q["e"], "tmin": q["min"], "tmax": q["max"], "pop": q["pop"], "text": q["text"], "code": wx_code(q["text"])}
+                     for q in periods]
+            out[name] = {"days": res[:3], "periods": plist[:3]}      # periods: 今天白天 / 今晚 / 明天白天 這種 12 小時一段的預報
     return out
 
 
