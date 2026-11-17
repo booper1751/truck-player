@@ -1,11 +1,11 @@
-name: Build EXE
+name: 打包 EXE 並發佈
 
-# 你把新的 ets2_player_qt.py (VERSION 加 1) 上傳到倉庫 -> 這裡自動在 Windows 雲端電腦打包 -> 發布成 Release。
 on:
   push:
     branches: [main, master]
     paths:
       - "ets2_player_qt.py"
+      - "requirements.txt"
       - "icon.ico"
       - ".github/workflows/build.yml"
   workflow_dispatch:
@@ -16,61 +16,61 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 讀取版本號，檢查這一版是不是已經發布過
-        id: ver
+      - name: 讀出程式裡的版本號
+        id: v
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          V=$(python -c "import re;print(re.search(r'^VERSION\s*=\s*(\d+)',open('ets2_player_qt.py',encoding='utf-8').read(),re.M).group(1))")
-          echo "v=$V" >> "$GITHUB_OUTPUT"
-          if gh release view "v$V" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          VER=$(grep -m1 -E '^VERSION *= *[0-9]+' ets2_player_qt.py | sed -E 's/^VERSION *= *([0-9]+).*/\1/')
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VER" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::v$V 已經發布過了，略過打包。要發新版請把 ets2_player_qt.py 裡的 VERSION 加 1。"
+            echo "v$VER 已經發佈過了，這次不重複打包 (要發新版請把 VERSION 加 1)。"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 安裝打包需要的套件
-        if: steps.ver.outputs.exists == 'false'
-        shell: bash
-        run: pip install pyinstaller PySide6-Essentials pygame mutagen keyboard
+      - uses: actions/setup-python@v5
+        if: steps.v.outputs.exists != 'true'
+        with:
+          python-version: "3.12"
 
-      - name: 把倉庫名稱寫進程式 (程式靠它找更新，原始碼裡不會有你的帳號)
-        if: steps.ver.outputs.exists == 'false'
+      - name: 安裝套件
+        if: steps.v.outputs.exists != 'true'
         shell: bash
         run: |
-          printf '{"repo": "%s"}' "$GITHUB_REPOSITORY" > build_info.json
-          cat build_info.json
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
 
-      - name: 打包成單一 EXE
-        if: steps.ver.outputs.exists == 'false'
+      - name: 帶入更新來源 (只放進 EXE，不會改到倉庫裡的原始碼)
+        if: steps.v.outputs.exists != 'true'
+        shell: python
+        run: |
+          import re
+          p = "ets2_player_qt.py"
+          s = open(p, encoding="utf-8").read()
+          s, n = re.subn(r'^UPDATE_SRC_DEFAULT = ""', 'UPDATE_SRC_DEFAULT = "${{ github.repository }}"', s, count=1, flags=re.M)
+          assert n == 1, "找不到 UPDATE_SRC_DEFAULT 那一行"
+          open(p, "w", encoding="utf-8").write(s)
+
+      - name: 打包
+        if: steps.v.outputs.exists != 'true'
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed \
-            --name TruckPlayer \
-            --icon icon.ico \
-            --add-data "build_info.json;." \
-            --hidden-import keyboard \
+          pyinstaller --noconfirm --onefile --noconsole --name TruckPlayer --icon icon.ico \
+            --hidden-import mutagen --hidden-import keyboard \
+            --collect-submodules edge_tts --hidden-import aiohttp --collect-data certifi \
             ets2_player_qt.py
-          ls -la dist/
+          ls -l dist
 
-      - name: 發布 Release
-        if: steps.ver.outputs.exists == 'false'
+      - name: 發佈
+        if: steps.v.outputs.exists != 'true'
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ steps.ver.outputs.v }}" dist/TruckPlayer.exe \
-            -R "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "v${{ steps.ver.outputs.v }}" \
-            --notes "自動打包的第 ${{ steps.ver.outputs.v }} 版。下載 TruckPlayer.exe 直接執行即可，已經在用的人會自動收到更新提示。" \
-            --latest
+          VER="${{ steps.v.outputs.ver }}"
+          gh release create "v$VER" dist/TruckPlayer.exe --repo "${{ github.repository }}" \
+            --title "卡車播放器 v$VER" --notes "自動打包的 Windows 版 (v$VER)。已安裝的程式會自動提示更新。"
