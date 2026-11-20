@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """卡車播放器 (Qt 版)  —  勾選資料夾 + 播放清單 + 播放次數排行榜 + 桌布背景(面板半透明)
-第一次執行會自動安裝: PySide6 (介面)、pygame (播放)、keyboard (全域快捷鍵，可選)
+第一次執行會自動安裝: PySide6 + PySide6-Addons (介面 / 影片播放)、pygame (音樂播放)、keyboard (全域快捷鍵，可選)
 全域快捷鍵: F9 上一首 / F10 播放暫停 / F11 下一首
 資料: 同資料夾的 player_config.json 與 player_stats.db (與舊 Tk 版共用，次數會保留)
 不會修改、搬動你的任何音樂檔。"""
@@ -26,7 +26,7 @@ def _setup_ssl():
 
 _setup_ssl()
 
-VERSION = 22     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 24     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
 UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
@@ -56,6 +56,9 @@ def ensure_deps():
     if importlib.util.find_spec("PySide6") is None:
         print("正在下載安裝 PySide6 (介面，約 100MB，請稍候) ...")
         _pip("PySide6-Essentials") or _pip("PySide6")
+    if importlib.util.find_spec("PySide6") is not None and importlib.util.find_spec("PySide6.QtMultimedia") is None:
+        print("正在下載安裝 PySide6-Addons (影片播放要用，約 100MB，請稍候) ...")
+        _pip("PySide6-Addons")
     if importlib.util.find_spec("pygame") is None:
         print("正在下載安裝 pygame ...")
         _pip("pygame") or _pip("pygame-ce")
@@ -75,12 +78,12 @@ def ensure_deps():
 if not FROZEN:
     ensure_deps()      # EXE 版已經把套件都包好了，不需要再安裝
 try:
-    from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer, QVariantAnimation, Signal
+    from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPoint, QPointF, QRect, QSize, Qt, QTimer, QVariantAnimation, Signal
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
-    from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImageReader, QIntValidator, QImage, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient, QLinearGradient, QBrush
+    from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImageReader, QIntValidator, QImage, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient, QLinearGradient, QBrush, QCursor
     from PySide6.QtWidgets import (QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
                                    QLineEdit, QListWidget, QListWidgetItem, QPushButton, QScrollArea, QSizeGrip, QSlider,
-                                   QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView, QMessageBox, QStyle, QProgressBar, QGraphicsDropShadowEffect, QMenu, QSystemTrayIcon)
+                                   QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QHeaderView, QMessageBox, QStyle, QProgressBar, QGraphicsDropShadowEffect, QMenu, QSystemTrayIcon, QBoxLayout, QSizePolicy, QInputDialog)
 except ImportError as e:
     print("PySide6 安裝失敗:", e, "\n", LAST_ERR)
     input("按 Enter 結束")
@@ -89,18 +92,29 @@ try:
     import pygame
 except ImportError:
     pygame = None
+try:                                    # 影片播放: Qt 的 QtMultimedia (在 PySide6-Addons 裡，ensure_deps 會自動安裝)
+    from PySide6.QtCore import QUrl
+    from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    VIDEO_OK = True
+except Exception:
+    VIDEO_OK = False
 
 SCRIPT = os.path.abspath(sys.executable if FROZEN else __file__)     # EXE 版: 這個 EXE 本身
 HERE = os.path.dirname(SCRIPT)
 CFG = os.path.join(HERE, "player_config.json")
 DB = os.path.join(HERE, "player_stats.db")
 EXTS = (".mp3", ".flac", ".wav", ".ogg", ".m4a")
+VIDEO_EXTS = (".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".flv", ".m4v",
+              ".ts", ".m2ts", ".mts", ".mpg", ".mpeg", ".3gp", ".ogv", ".vob", ".asf", ".divx", ".rmvb")
 COUNT_AFTER_S = 30
 SKIP_BEFORE_S = 10
 COLD_SORT = "冷門榜(次數少→多)"
 WP_MODES = ["每首歌換一張", "每 30 分鐘換一張", "每 1 小時換一張", "不換 (維持目前這張)"]
 WP_INTERVAL = {"每 30 分鐘換一張": 1800, "每 1 小時換一張": 3600}
-SORTS = ["常聽榜", "近期熱門(30天)", "最近播放", "從沒聽過", "跳過最多", COLD_SORT, "資料夾順序"]
+RECENT_SORT = "最近新增(7天)"
+RECENT_DAYS = 7
+SORTS = ["常聽榜", "近期熱門(30天)", "最近播放", RECENT_SORT, "從沒聽過", "跳過最多", COLD_SORT, "資料夾順序"]
 
 # tint = 面板底色(RGB)；text = 文字色；accent = 強調色；base = 沒有桌布時的背景色
 THEMES = {
@@ -371,6 +385,26 @@ def load_cfg():
     c.setdefault("repeat", 0)              # 0=不循環 1=全部循環 2=單曲循環
     if c["repeat"] not in (0, 1, 2):
         c["repeat"] = 0
+    c.setdefault("mode", "music")          # music = 音樂播放器 / video = 影片播放器
+    c.setdefault("video_folders", [])      # 影片模式: 拖進來 / 加入的資料夾
+    c.setdefault("video_files", [])        # 影片模式: 單獨加入的影片檔
+    c.setdefault("video_off", [])          # 影片模式: 沒有勾選的影片 (預設全部勾選)
+    c.setdefault("dl_vdir", "")            # 下載影片的存放位置
+    c.setdefault("dl_vq", "1080p")         # 下載影片的畫質上限
+    c.setdefault("search_open", True)      # 搜尋列是否展開 (可收成一個 🔍 按鈕)
+    c.setdefault("auto_pause", True)       # 影片模式: 切到別的視窗就自動暫停
+    c.setdefault("video_tools_open", True) # 影片清單下面的小抽屜 (下載影片…) 是否展開
+    c.setdefault("lock", {})               # 資料夾鎖: 密碼雜湊、被鎖的資料夾、鎖之前硬碟上的隱藏狀態
+    if not isinstance(c["lock"], dict):
+        c["lock"] = {}
+    c["lock"].setdefault("salt", "")
+    c["lock"].setdefault("hash", "")
+    c["lock"].setdefault("folders", [])
+    c["lock"].setdefault("orig", {})
+    c.setdefault("video_list_on", True)    # 影片模式: 右邊的播放清單是否顯示
+    c.setdefault("video_open", None)       # 影片模式: 展開中的資料夾 (None = 第一次，頂層資料夾預設展開)
+    if c["mode"] not in ("music", "video"):
+        c["mode"] = "music"
     if c["theme"] not in THEMES:
         c["theme"] = "Discord 深色"
     return c
@@ -384,11 +418,64 @@ def save_cfg(c):
         pass
 
 
-def scan(folder):
+def added_time(path):
+    """檔案是什麼時候「加進電腦」的: 用檔案建立時間 (Windows 上複製 / 下載進來的檔案，建立時間就是那一刻)"""
+    try:
+        st = os.stat(path)
+        return float(getattr(st, "st_birthtime", st.st_ctime))
+    except OSError:
+        return 0.0
+
+
+HIDE_BITS = 0x2 | 0x4          # Windows 檔案屬性: 隱藏 (H) + 系統 (S)
+
+
+def _win_attr_api():
+    k = ctypes.windll.kernel32
+    k.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    k.GetFileAttributesW.restype = ctypes.c_uint32
+    k.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    k.SetFileAttributesW.restype = ctypes.c_int
+    return k
+
+
+def hide_on_disk(path):
+    """把資料夾在硬碟上設成「隱藏 + 系統」(檔案總管預設看不到，檔案內容不動)。回傳 (成功?, 原本的隱藏位元)"""
+    if not IS_WIN:
+        return False, 0
+    try:
+        k = _win_attr_api()
+        a = k.GetFileAttributesW(str(path))
+        if a == 0xFFFFFFFF:
+            return False, 0
+        return bool(k.SetFileAttributesW(str(path), a | HIDE_BITS)), a & HIDE_BITS
+    except Exception:
+        return False, 0
+
+
+def restore_on_disk(path, orig_bits=0):
+    """解除鎖定時，把硬碟上的隱藏狀態恢復成鎖之前的樣子"""
+    if not IS_WIN:
+        return False
+    try:
+        k = _win_attr_api()
+        a = k.GetFileAttributesW(str(path))
+        if a == 0xFFFFFFFF:
+            return False
+        return bool(k.SetFileAttributesW(str(path), (a & ~HIDE_BITS) | (int(orig_bits) & HIDE_BITS)))
+    except Exception:
+        return False
+
+
+def _pw_hash(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, 200000).hex()
+
+
+def scan(folder, exts=EXTS):
     out = []
     for root, _, files in os.walk(folder):
         for n in files:
-            if n.lower().endswith(EXTS):
+            if n.lower().endswith(exts):
                 out.append(os.path.join(root, n))
     return out
 
@@ -1551,7 +1638,7 @@ class DownloadDialog(QDialog):
     """下載音樂 (YouTube 等網站，使用 yt-dlp)。下載完的歌自動加進播放器清單。"""
     ui = Signal(object)          # 背景執行緒用: 丟一個函式回主執行緒執行
 
-    def __init__(self, pl):
+    def __init__(self, pl, kind="music"):
         super().__init__(pl)
         self.pl = pl
         self.setWindowTitle("下載音樂")
@@ -1559,13 +1646,21 @@ class DownloadDialog(QDialog):
         self.ui.connect(lambda fn: fn())
         self.running = self.tools_busy = False
         self._stop = False
+        self._job_kind = "music"
         self.paths = {}
         self.stats = {"ok": 0, "skip": 0, "fail": 0, "total": 0}
         c = pl.cfg
         v = QVBoxLayout(self)
-        t = QLabel("⬇ 下載音樂")
-        t.setObjectName("dtitle")
-        v.addWidget(t)
+        self.title_lbl = QLabel("⬇ 下載音樂")
+        self.title_lbl.setObjectName("dtitle")
+        v.addWidget(self.title_lbl)
+        r = QHBoxLayout()
+        r.addWidget(QLabel("類型:"))
+        self.kind_cb = QComboBox()
+        self.kind_cb.addItems(["🎵 音樂 (mp3)", "🎬 影片 (mp4)"])
+        r.addWidget(self.kind_cb)
+        r.addStretch(1)
+        v.addLayout(r)
         v.addWidget(QLabel("連結（單首或合輯/播放清單皆可）:"))
         r = QHBoxLayout()
         self.url = QLineEdit()
@@ -1577,9 +1672,15 @@ class DownloadDialog(QDialog):
         v.addLayout(r)
 
         r = QHBoxLayout()
-        r.addWidget(QLabel("音質(kbps):"))
+        self.br_lbl = QLabel("音質(kbps):")
+        r.addWidget(self.br_lbl)
         self.br = QComboBox(); self.br.addItems(["320", "256", "192", "128"]); self.br.setCurrentText(str(c["dl_br"]))
         r.addWidget(self.br)
+        self.vq_lbl = QLabel("畫質:")
+        r.addWidget(self.vq_lbl)
+        self.vq = QComboBox(); self.vq.addItems(["最高", "1080p", "720p", "480p"]); self.vq.setCurrentText(str(c["dl_vq"]))
+        self.vq.setToolTip("影片畫質上限 (實際會挑不超過這個的最高畫質)")
+        r.addWidget(self.vq)
         r.addSpacing(10)
         r.addWidget(QLabel("多段下載:"))
         self.seg = QComboBox(); self.seg.addItems(["1", "4", "8", "16"]); self.seg.setCurrentText(str(c["dl_seg"]))
@@ -1609,6 +1710,8 @@ class DownloadDialog(QDialog):
         r.addWidget(QLabel("存到:"))
         first = next((f for f, on in c["folders"].items() if on), "")
         self.dst = QLineEdit(c["dl_dir"] or first or os.path.join(HERE, "下載"))
+        self._dsts = {"music": self.dst.text(),
+                      "video": c["dl_vdir"] or (c["video_folders"][0] if c["video_folders"] else os.path.join(HERE, "下載影片"))}
         r.addWidget(self.dst, 1)
         db = QPushButton("選擇資料夾…")
         db.clicked.connect(self._pick_dst)
@@ -1632,7 +1735,8 @@ class DownloadDialog(QDialog):
         self.tool_bar.hide()
         v.addWidget(self.tool_bar)
 
-        v.addWidget(QLabel("歌曲清單（雙擊可在資料夾中定位檔案）:"))
+        self.list_lbl = QLabel("歌曲清單（雙擊可在資料夾中定位檔案）:")
+        v.addWidget(self.list_lbl)
         self.listw = QListWidget()
         self.listw.itemDoubleClicked.connect(self._open_loc)
         v.addWidget(self.listw, 1)
@@ -1667,7 +1771,32 @@ class DownloadDialog(QDialog):
         r.addWidget(close)
         v.addLayout(r)
         self._summary()
+        self._vid_prev = False
+        self.kind_cb.setCurrentIndex(1 if kind == "video" else 0)
+        self._kind_changed()
+        self.kind_cb.currentIndexChanged.connect(self._kind_changed)
         self.refresh_tools()
+
+    # ---- 音樂 / 影片 ----
+    def set_kind(self, kind):
+        if self.running:
+            return
+        self.kind_cb.setCurrentIndex(1 if kind == "video" else 0)
+        self._kind_changed()
+
+    def _kind_changed(self, *_):
+        vid = self.kind_cb.currentIndex() == 1
+        if vid != self._vid_prev:                      # 音樂和影片各記各的存放位置
+            self._dsts["video" if self._vid_prev else "music"] = self.dst.text()
+            self.dst.setText(self._dsts["video" if vid else "music"])
+            self._vid_prev = vid
+        for w in (self.br_lbl, self.br):
+            w.setVisible(not vid)
+        for w in (self.vq_lbl, self.vq):
+            w.setVisible(vid)
+        self.title_lbl.setText("⬇ 下載影片" if vid else "⬇ 下載音樂")
+        self.setWindowTitle("下載影片" if vid else "下載音樂")
+        self.list_lbl.setText(("影片" if vid else "歌曲") + "清單（雙擊可在資料夾中定位檔案）:")
 
     # ---- 小工具 ----
     def _pick_dst(self):
@@ -1807,10 +1936,17 @@ class DownloadDialog(QDialog):
             QMessageBox.warning(self, "提示", f"無法建立資料夾:\n{e}")
             return
         o = {"br": self.br.currentText(), "seg": int(self.seg.currentText()), "playlist": self.pl_cb.isChecked(),
-             "start": self.start.value(), "aria": self.aria_cb.isChecked()}
+             "start": self.start.value(), "aria": self.aria_cb.isChecked(),
+             "kind": "video" if self.kind_cb.currentIndex() == 1 else "music", "vq": self.vq.currentText()}
         c = self.pl.cfg
-        c.update(dl_dir=base, dl_br=o["br"], dl_seg=o["seg"], dl_playlist=o["playlist"], dl_aria2=o["aria"])
+        c.update(dl_seg=o["seg"], dl_playlist=o["playlist"], dl_aria2=o["aria"])
+        if o["kind"] == "video":
+            c.update(dl_vdir=base, dl_vq=o["vq"])
+        else:
+            c.update(dl_dir=base, dl_br=o["br"])
         save_cfg(c)
+        self._job_kind = o["kind"]
+        self.kind_cb.setEnabled(False)
         self.running, self._stop = True, False
         self.go.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1826,11 +1962,12 @@ class DownloadDialog(QDialog):
     def _job_done(self, save_path):
         self.running = False
         self.stop_btn.setEnabled(False)
+        self.kind_cb.setEnabled(True)
         self.status.setText("準備就緒")
         self.bar.setValue(0)
         self.refresh_tools()
         if save_path and os.path.isdir(save_path):
-            self.pl.after_download(save_path)
+            self.pl.after_download(save_path, self._job_kind)
 
     def _run_job(self, url, base, o):
         st = self.stats
@@ -1851,7 +1988,7 @@ class DownloadDialog(QDialog):
                 return
             save_path = os.path.join(base, folder_name)
             os.makedirs(save_path, exist_ok=True)
-            history_file = os.path.join(save_path, "download_history.txt")
+            history_file = os.path.join(save_path, "download_history_video.txt" if o["kind"] == "video" else "download_history.txt")
             archived = load_archive(history_file)
             st["total"] = len(entries)
             for i, e in enumerate(entries):
@@ -1873,6 +2010,12 @@ class DownloadDialog(QDialog):
                 "format": "bestaudio/best",
                 "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": o["br"]}],
             }
+            if o["kind"] == "video":                # 影片: 下載最好的影像 + 聲音，用 ffmpeg 合併成 mp4 (不轉成 mp3)
+                h = {"1080p": 1080, "720p": 720, "480p": 480}.get(o["vq"])
+                opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b" if h else "bv*+ba/b"
+                opts["format_sort"] = ["res", "ext:mp4:m4a"]       # 同畫質時優先挑 mp4 / m4a，各種播放器都能放
+                opts["merge_output_format"] = "mp4"
+                opts.pop("postprocessors", None)
             aria = aria2c_path() if o["aria"] else ""
             if aria:
                 os.environ["PATH"] = os.path.dirname(aria) + os.pathsep + os.environ.get("PATH", "")
@@ -1923,7 +2066,7 @@ class DownloadDialog(QDialog):
                 if self._stop:
                     return "stop"
                 if not ok:                                   # 轉檔階段才出錯，但檔案其實已經產生的情況
-                    exts = {".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus", ".wma"}
+                    exts = {".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus", ".wma", ".mkv", ".webm"}
                     key = title.lower()[:15]
                     try:
                         ok = any(key in f.lower() for f in os.listdir(save_path) if os.path.splitext(f)[1].lower() in exts)
@@ -1965,7 +2108,7 @@ class DownloadDialog(QDialog):
             self.ui.emit(lambda: QMessageBox.information(
                 self, "全部完成",
                 f"🎉 全部處理完畢！\n\n✅ 成功下載：{s['ok']} 首\n⏭️ 已有自動跳過：{s['skip']} 首\n⚠️ 無法下載：{s['fail']} 首\n"
-                f"────────────────\n📋 合計掃描：{s['total']} 首\n\n新下載的歌已加進播放清單。"))
+                f"────────────────\n📋 合計掃描：{s['total']} 首\n\n新下載的{'影片' if o['kind'] == 'video' else '歌'}已加進播放清單。"))
         except Exception as err:
             msg = str(err)
             self.ui.emit(lambda: QMessageBox.critical(self, "失敗", f"下載失敗！\n如果是 yt-dlp 的問題，請按「重新下載 yt-dlp」再試。\n\n錯誤：{msg}"))
@@ -2053,7 +2196,7 @@ class DownloadDialog(QDialog):
         def work():
             try:
                 yt = get_ytdlp()
-                exts = {".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus", ".wma"}
+                exts = {".mp3", ".mp4", ".m4a", ".flac", ".wav", ".ogg", ".aac", ".opus", ".wma", ".mkv", ".webm"}
                 existing = {os.path.splitext(f)[0].lower().strip() for f in os.listdir(target) if os.path.splitext(f)[1].lower() in exts}
 
                 def status_cb(text, color=None):
@@ -2927,6 +3070,240 @@ def starfield(w, h):
     return img
 
 
+class PwDialog(QDialog):
+    """輸入密碼的小視窗 (左下角多一個「忘記密碼」按鈕)"""
+
+    def __init__(self, parent, title, text):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(380)
+        self.forgot = False
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel(text))
+        self.edit = QLineEdit()
+        self.edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit.returnPressed.connect(self.accept)
+        v.addWidget(self.edit)
+        r = QHBoxLayout()
+        fg = QPushButton("🆘 忘記密碼")
+        fg.clicked.connect(self._forgot)
+        ok = QPushButton("確定")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        r.addWidget(fg)
+        r.addStretch(1)
+        r.addWidget(ok)
+        r.addWidget(cancel)
+        v.addLayout(r)
+
+    def _forgot(self):
+        self.forgot = True
+        self.reject()
+
+    def text(self):
+        return self.edit.text()
+
+
+class LockDialog(QDialog):
+    """選擇要鎖起來的資料夾 (打勾 = 鎖定)"""
+
+    def __init__(self, pl, paths, locked, change_pw):
+        super().__init__(pl)
+        self.setWindowTitle("資料夾鎖定設定")
+        self.resize(660, 480)
+        v = QVBoxLayout(self)
+        t = QLabel("🔒 資料夾鎖定")
+        t.setObjectName("dtitle")
+        v.addWidget(t)
+        tip = QLabel("打勾的資料夾會被鎖起來：沒解鎖的時候，播放器的清單裡看不到它們，而且在硬碟上會被設成隱藏 (檔案總管預設看不到)。"
+                     "取消打勾 = 解除鎖定，硬碟上的隱藏也會恢復。\n"
+                     "注意：這是「藏起來 + 密碼」，不是加密。懂電腦的人打開「顯示隱藏的檔案」或直接輸入路徑，還是進得去。")
+        tip.setObjectName("sub")
+        tip.setWordWrap(True)
+        v.addWidget(tip)
+        self.lw = QListWidget()
+        for p in paths:
+            it = QListWidgetItem(p)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Checked if os.path.normcase(os.path.normpath(p)) in locked else Qt.Unchecked)
+            it.setData(Qt.UserRole, p)
+            it.setToolTip(p)
+            self.lw.addItem(it)
+        v.addWidget(self.lw, 1)
+        r = QHBoxLayout()
+        pw = QPushButton("🔑 更改密碼…")
+        pw.clicked.connect(change_pw)
+        ok = QPushButton("確定")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        r.addWidget(pw)
+        r.addStretch(1)
+        r.addWidget(ok)
+        r.addWidget(cancel)
+        v.addLayout(r)
+
+    def checked(self):
+        return [self.lw.item(i).data(Qt.UserRole) for i in range(self.lw.count()) if self.lw.item(i).checkState() == Qt.Checked]
+
+
+class VideoTree(QTreeWidget):
+    """影片清單: 可以從檔案總管把資料夾或影片檔直接拖進來"""
+    dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            e.acceptProposedAction()
+            self.dropped.emit(paths)
+        else:
+            e.ignore()
+
+
+if VIDEO_OK:
+    class VideoView(QVideoWidget):
+        """影片畫面 (像 MPC-HC): 雙擊 = 全螢幕 / 還原，滑鼠滾輪 = 音量，空白鍵 = 播放 / 暫停，
+        也可以把影片檔或資料夾直接拖進畫面來播"""
+        dropped = Signal(list)
+        moved = Signal()
+
+        def __init__(self):
+            super().__init__()
+            self.on_toggle_fs = self.on_key = self.on_wheel = None
+            self.setMinimumHeight(160)
+            self.setFocusPolicy(Qt.StrongFocus)
+            self.setMouseTracking(True)
+            self.setAcceptDrops(True)
+            self.setStyleSheet("background-color: black;")
+
+        def mouseDoubleClickEvent(self, e):
+            if self.on_toggle_fs:
+                self.on_toggle_fs()
+            self.setFocus()
+            e.accept()
+
+        def mouseMoveEvent(self, e):
+            self.moved.emit()
+            super().mouseMoveEvent(e)
+
+        def keyPressEvent(self, e):
+            if self.on_key and self.on_key(e):
+                e.accept()
+                return
+            super().keyPressEvent(e)
+
+        def wheelEvent(self, e):
+            if self.on_wheel and self.on_wheel(e.angleDelta().y()):
+                e.accept()
+                return
+            super().wheelEvent(e)
+
+        def dragEnterEvent(self, e):
+            if e.mimeData().hasUrls():
+                e.acceptProposedAction()
+            else:
+                e.ignore()
+
+        def dragMoveEvent(self, e):
+            if e.mimeData().hasUrls():
+                e.acceptProposedAction()
+            else:
+                e.ignore()
+
+        def dropEvent(self, e):
+            paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+            if paths:
+                e.acceptProposedAction()
+                QTimer.singleShot(0, lambda p=paths: self.dropped.emit(p))
+            else:
+                e.ignore()
+
+
+class FsBar(QFrame):
+    """全螢幕時浮在畫面下方的控制列 (像 MPC-HC: 滑鼠動一下才出現，不動就自動收起)。
+    它是獨立的小視窗，不搶鍵盤焦點，所以空白鍵 / Esc 還是由影片畫面接收。"""
+
+    def __init__(self):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
+        self.setObjectName("fsbar")
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFixedHeight(92)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(18, 8, 18, 10)
+        v.setSpacing(4)
+        sr = QHBoxLayout()
+        self.cur_lbl = QLabel("0:00")
+        self.cur_lbl.setFixedWidth(56)
+        self.cur_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        sr.addWidget(self.cur_lbl)
+        self.seek = SeekSlider()
+        sr.addWidget(self.seek, 1)
+        self.tot_lbl = QLabel("0:00")
+        self.tot_lbl.setFixedWidth(56)
+        sr.addWidget(self.tot_lbl)
+        v.addLayout(sr)
+        cr = QHBoxLayout()
+        cr.setSpacing(6)
+
+        def mk(txt, tip, w=46):
+            b = QPushButton(txt)
+            b.setFixedSize(w, 32)
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.NoFocus)
+            cr.addWidget(b)
+            return b
+
+        self.prev_btn = mk("◀◀", "上一部")
+        self.play_btn = mk("▶", "播放 / 暫停")
+        self.stop_btn = mk("⏹", "停止")
+        self.next_btn = mk("▶▶", "下一部")
+        cr.addSpacing(14)
+        self.vol_lbl = QLabel("🔊")
+        cr.addWidget(self.vol_lbl)
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setFixedWidth(120)
+        self.vol.setFocusPolicy(Qt.NoFocus)
+        cr.addWidget(self.vol)
+        cr.addSpacing(14)
+        self.title = QLabel("")
+        self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)      # 片名太長就自動被截掉，不會把控制列撐寬
+        cr.addWidget(self.title, 1)
+        self.exit_btn = mk("⛶ 離開全螢幕", "離開全螢幕 (Esc)", 120)
+        v.addLayout(cr)
+        self.style_it("#5865f2")
+
+    def style_it(self, acc):
+        self.setStyleSheet(f"""
+        QFrame#fsbar {{ background-color: rgba(18,19,23,235); }}
+        QLabel {{ color: #f2f3f5; background: transparent; font-size: 13px; font-family: "Microsoft JhengHei UI", "Noto Sans CJK TC", sans-serif; }}
+        QPushButton {{ color: #f2f3f5; background-color: rgba(255,255,255,28); border: none; border-radius: 6px; font-size: 14px; font-family: "Microsoft JhengHei UI", "Noto Sans CJK TC", sans-serif; }}
+        QPushButton:hover {{ background-color: {acc}; color: #ffffff; }}
+        QSlider::groove:horizontal {{ height: 6px; background: rgba(255,255,255,60); border-radius: 3px; }}
+        QSlider::sub-page:horizontal {{ background: {acc}; border-radius: 3px; }}
+        QSlider::handle:horizontal {{ background: #ffffff; width: 14px; height: 14px; margin: -4px 0; border-radius: 7px; }}
+        """)
+
+
 class Player(QWidget):
     def __init__(self):
         super().__init__()
@@ -2949,6 +3326,10 @@ class Player(QWidget):
         self._wp_list, self._wp_idx, self._next_slide = [], -1, 0.0
         self._dl_dlg = None
         self._bg_cache = None
+        self.mode = self.cfg["mode"] if VIDEO_OK else "music"
+        self._vdrawer_open = False    # 影片模式下，右邊「定時 / 報時」抽屜預設收起來 (只在這次執行期間記得，不存檔)
+        self._added_cache = {}        # 路徑 -> 檔案建立時間 (「最近新增」用，這次執行期間快取)
+        self._unlocked = False        # 資料夾鎖: 每次開程式都是「上鎖」狀態 (解鎖只在這次執行期間有效，不會存起來)
 
         self.setWindowTitle(f"卡車播放器 v{VERSION}")
         self.resize(1280, 760)
@@ -2965,7 +3346,21 @@ class Player(QWidget):
         pygame.mixer.init()
         pygame.mixer.music.set_volume(self.cfg["volume"] / 100)
 
+        self.vplayer = self.vaudio = None          # 影片播放器 (跟音樂用的 pygame 是分開的兩套)
+        if VIDEO_OK:
+            self.vplayer = QMediaPlayer(self)
+            self.vaudio = QAudioOutput(self)
+            self.vaudio.setVolume(self.cfg["volume"] / 100)
+            self.vplayer.setAudioOutput(self.vaudio)
+            self.vplayer.durationChanged.connect(self._v_duration)
+            self.vplayer.mediaStatusChanged.connect(self._v_status)
+            self.vplayer.metaDataChanged.connect(self._v_meta)
+            self.vplayer.errorOccurred.connect(self._v_error)
+
         self._build()
+        if self.vplayer:
+            self.vplayer.setVideoOutput(self.video_view)
+        self.set_mode(self.mode, first=True)
         self._apply_folders_open()
         self._apply_tools(animate=False)
         self._apply_drawer(animate=False)
@@ -2981,6 +3376,7 @@ class Player(QWidget):
         self.timer.start(500)
         self._clock_tick()
         self._hotkeys()
+        QApplication.instance().applicationStateChanged.connect(self._app_state)
         self._quitting = False
         self.setWindowIcon(app_icon())
         self._setup_tray()
@@ -3061,7 +3457,7 @@ class Player(QWidget):
         hb.addWidget(b2)
         tl.addLayout(hb)
         b6 = QPushButton("⬇ 下載音樂…")
-        b6.clicked.connect(self.open_download)
+        b6.clicked.connect(lambda: self.open_download("music"))
         tl.addWidget(b6)
         b4 = QPushButton("🔍 找重複歌曲…")
         b4.clicked.connect(self.find_dups)
@@ -3075,6 +3471,14 @@ class Player(QWidget):
         b5 = QPushButton(f"🔄 檢查更新 (v{VERSION})")
         b5.clicked.connect(self.open_update)
         tl.addWidget(b5)
+        hl = QHBoxLayout()
+        self.lock_toggle_m = QPushButton()
+        self.lock_toggle_m.clicked.connect(self._lock_toggle)
+        bls = QPushButton("⚙ 鎖定設定…")
+        bls.clicked.connect(self.lock_manage)
+        hl.addWidget(self.lock_toggle_m)
+        hl.addWidget(bls)
+        tl.addLayout(hl)
         lv.addWidget(self.tools_box)
         body.addWidget(left)
 
@@ -3095,19 +3499,37 @@ class Player(QWidget):
         self.fold_btn.setFixedSize(40, 32)
         self.fold_btn.clicked.connect(self._toggle_folders)
         r1.addWidget(self.fold_btn)
+        self.mode_btn = QPushButton()
+        self.mode_btn.setObjectName("modebtn")
+        self.mode_btn.setMinimumWidth(96)
+        self.mode_btn.setFixedHeight(32)
+        self.mode_btn.clicked.connect(self._toggle_mode)
+        r1.addWidget(self.mode_btn)
         r1.addSpacing(6)
-        r1.addWidget(QLabel("排序:"))
+        self.sort_lbl = QLabel("排序:")
+        r1.addWidget(self.sort_lbl)
         self.sort_cb = QComboBox()
         self.sort_cb.addItems(SORTS)
         self.sort_cb.setCurrentText(self.cfg["sort"])
         self.sort_cb.currentTextChanged.connect(self._sort_changed)
         r1.addWidget(self.sort_cb)
         r1.addSpacing(12)
-        r1.addWidget(QLabel("搜尋:"))
+        self.search_box = QWidget()
+        sl = QHBoxLayout(self.search_box)
+        sl.setContentsMargins(0, 0, 0, 0)
+        self.search_btn = QPushButton("🔍")
+        self.search_btn.setObjectName("foldbtn")
+        self.search_btn.setFixedSize(40, 32)
+        self.search_btn.clicked.connect(self._toggle_search)
+        sl.addWidget(self.search_btn)
+        self.search_lbl = QLabel("搜尋:")
+        sl.addWidget(self.search_lbl)
         self.search = QLineEdit()
         self.search.setPlaceholderText("輸入歌名關鍵字")
         self.search.textChanged.connect(lambda *_: self.apply_sort())
-        r1.addWidget(self.search, 1)
+        sl.addWidget(self.search, 1)
+        r1.addWidget(self.search_box, 1)
+        self._apply_search()
         self.clock_btn = QPushButton("⏱")
         self.clock_btn.setObjectName("clockbtn")
         self.clock_btn.setMinimumWidth(96)
@@ -3117,6 +3539,7 @@ class Player(QWidget):
         r1.addWidget(self.clock_btn)
         tv.addLayout(r1)
         r2 = QHBoxLayout()
+        r2.setContentsMargins(0, 0, 0, 0)
         r2.addWidget(QLabel("背景:"))
         self.theme_cb = QComboBox()
         self.theme_cb.addItems(list(THEMES))
@@ -3147,8 +3570,27 @@ class Player(QWidget):
         self.frameless_cb.setChecked(self.cfg["frameless"])
         self.frameless_cb.toggled.connect(lambda on: self._set_frameless(on))
         r2.addWidget(self.frameless_cb)
-        tv.addLayout(r2)
+        self.tool_r2w = QWidget()          # 影片模式時整排收起來，把空間讓給畫面
+        self.tool_r2w.setLayout(r2)
+        tv.addWidget(self.tool_r2w)
         rv.addWidget(tool)
+
+        self.video_panel = self._panel()
+        vpl = QVBoxLayout(self.video_panel)
+        vpl.setContentsMargins(8, 8, 8, 8)
+        if VIDEO_OK:
+            self.video_view = VideoView()
+        else:
+            self.video_view = QLabel("這台電腦的 PySide6 沒有 QtMultimedia，無法播放影片")
+            self.video_view.setAlignment(Qt.AlignCenter)
+        vpl.addWidget(self.video_view, 1)
+        if VIDEO_OK:
+            self.video_view.on_toggle_fs = self._toggle_fullscreen
+            self.video_view.on_key = self._video_key
+            self.video_view.on_wheel = self._video_wheel
+            self.video_view.moved.connect(self._fs_motion)
+            self.video_view.dropped.connect(self._v_drop_play)
+        self.video_panel.hide()
 
         listp = self._panel()
         lv2 = QVBoxLayout(listp)
@@ -3170,7 +3612,84 @@ class Player(QWidget):
         self.tree.setColumnWidth(3, 70)
         self.tree.itemDoubleClicked.connect(lambda it, _c: self.play_index(it.data(0, Qt.UserRole)))
         lv2.addWidget(self.tree)
-        rv.addWidget(listp, 1)
+
+        # 影片模式的清單: 資料夾可展開、每部影片可勾選、可把資料夾拖進來
+        self._v_items, self._v_last = {}, (None, 0.0)
+        self._v_open = set(self.cfg["video_open"] or [])
+        self._v_save_t = QTimer(self)
+        self._v_save_t.setSingleShot(True)
+        self._v_save_t.setInterval(150)
+        self._v_save_t.timeout.connect(self._v_commit)
+        self.video_box = QWidget()
+        vb = QVBoxLayout(self.video_box)
+        vb.setContentsMargins(0, 0, 0, 0)
+        vr = QHBoxLayout()
+        for txt, fn in (("＋ 資料夾", self._v_add_dialog), ("＋ 影片檔", self._v_add_files_dialog),
+                        ("全選", lambda: self._v_set_all(True)), ("全不選", lambda: self._v_set_all(False))):
+            b = QPushButton(txt)
+            b.clicked.connect(fn)
+            vr.addWidget(b)
+        vb.addLayout(vr)
+        self.v_count_lbl = QLabel("")
+        self.v_count_lbl.setObjectName("sub")
+        vb.addWidget(self.v_count_lbl)
+        self.vtree = VideoTree()
+        self.vtree.setHeaderHidden(True)
+        self.vtree.setRootIsDecorated(False)
+        self.vtree.setUniformRowHeights(True)
+        self.vtree.setExpandsOnDoubleClick(False)
+        self.vtree.setIndentation(22)
+        self.vtree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.vtree.dropped.connect(self._v_add_paths)
+        self.vtree.itemClicked.connect(self._v_clicked)
+        self.vtree.itemChanged.connect(lambda *_: self._v_save_t.start())
+        self.vtree.itemExpanded.connect(self._v_expand_changed)
+        self.vtree.itemCollapsed.connect(self._v_expand_changed)
+        self.vtree.customContextMenuRequested.connect(self._v_menu)
+        vb.addWidget(self.vtree, 1)
+        self.v_tools_bar = QPushButton("▼")
+        self.v_tools_bar.setObjectName("drawerbar")
+        self.v_tools_bar.setFixedHeight(22)
+        self.v_tools_bar.clicked.connect(self._toggle_vtools)
+        vb.addWidget(self.v_tools_bar)
+        self.v_tools_box = QWidget()
+        self.v_tools_box.setObjectName("toolsbox")
+        vt = QVBoxLayout(self.v_tools_box)
+        vt.setContentsMargins(0, 0, 0, 0)
+        vt.setSpacing(6)
+        hb2 = QHBoxLayout()
+        bdl = QPushButton("⬇ 下載影片…")
+        bdl.clicked.connect(lambda: self.open_download("video"))
+        brs = QPushButton("重新掃描")
+        brs.clicked.connect(self._v_reload)
+        hb2.addWidget(bdl)
+        hb2.addWidget(brs)
+        vt.addLayout(hb2)
+        hl2 = QHBoxLayout()
+        self.lock_toggle_v = QPushButton()
+        self.lock_toggle_v.clicked.connect(self._lock_toggle)
+        bls2 = QPushButton("⚙ 鎖定設定…")
+        bls2.clicked.connect(self.lock_manage)
+        hl2.addWidget(self.lock_toggle_v)
+        hl2.addWidget(bls2)
+        vt.addLayout(hl2)
+        self._lock_btns = [self.lock_toggle_m, self.lock_toggle_v]
+        self._lock_ui()
+        self.autopause_cb = QCheckBox("切到別的視窗就自動暫停")
+        self.autopause_cb.setChecked(bool(self.cfg["auto_pause"]))
+        self.autopause_cb.toggled.connect(self._autopause_changed)
+        vt.addWidget(self.autopause_cb)
+        vb.addWidget(self.v_tools_box)
+        self._apply_vtools()
+        lv2.addWidget(self.video_box, 1)
+        self.video_box.hide()
+        self.listp = listp
+        self.mid = QBoxLayout(QBoxLayout.TopToBottom)        # 音樂模式: 上下排；影片模式: 左邊畫面、右邊清單
+        self.mid.setContentsMargins(0, 0, 0, 0)
+        self.mid.setSpacing(12)
+        self.mid.addWidget(self.video_panel, 1)
+        self.mid.addWidget(listp, 1)
+        rv.addLayout(self.mid, 1)
 
         # 下: 音量條(歌名上方) + 歌名 + 控制
         bottom = self._panel()
@@ -3197,10 +3716,13 @@ class Player(QWidget):
         self.now_lbl.setFont(f)
         bv.addWidget(self.now_lbl)
         cr = QHBoxLayout()
-        for txt, fn in (("◀◀", self.prev), ("▶ / ❚❚", self.toggle), ("▶▶", self.next)):
+        for txt, fn, attr in (("◀◀", self.prev, ""), ("▶ / ❚❚", self.toggle, ""), ("⏹", self.stop_play, "stop_btn"), ("▶▶", self.next, "")):
             b = QPushButton(txt)
-            b.setMinimumWidth(70)
+            b.setMinimumWidth(52 if attr else 70)
             b.clicked.connect(fn)
+            if attr:
+                setattr(self, attr, b)
+                b.setToolTip("停止 (畫面和進度條歸零)")
             cr.addWidget(b)
         self.cold_btn = QPushButton("📉 從冷門歌開始播")
         self.cold_btn.setMinimumWidth(130)
@@ -3233,6 +3755,19 @@ class Player(QWidget):
         self.shuffle_cb.toggled.connect(lambda on: self.cfg.__setitem__("shuffle", on))
         cr.addWidget(self.shuffle_cb)
         cr.addStretch(1)
+        self.list_btn = QPushButton("📋 清單")
+        self.list_btn.setObjectName("shufbtn")
+        self.list_btn.setCheckable(True)
+        self.list_btn.setMinimumWidth(80)
+        self.list_btn.setChecked(bool(self.cfg["video_list_on"]))
+        self.list_btn.setToolTip("顯示 / 隱藏右邊的播放清單 (快捷鍵 L)")
+        self.list_btn.toggled.connect(self._toggle_vlist)
+        cr.addWidget(self.list_btn)
+        self.fs_btn = QPushButton("⛶ 全螢幕")
+        self.fs_btn.setMinimumWidth(100)
+        self.fs_btn.setToolTip("全螢幕 (也可以雙擊畫面或按 F，Esc 離開；全螢幕時滑鼠一動就會跳出控制列)")
+        self.fs_btn.clicked.connect(self._toggle_fullscreen)
+        cr.addWidget(self.fs_btn)
         bv.addLayout(cr)
         wrap = QHBoxLayout()
         wrap.setContentsMargins(14, 0, 14, 14)
@@ -3257,6 +3792,24 @@ class Player(QWidget):
         pv.addWidget(self.vol, 1, Qt.AlignHCenter)
         self.pop.setFixedSize(64, 210)
         self._update_vol_icon(self.cfg["volume"])
+
+        # 全螢幕時浮在畫面下方的控制列 (獨立小視窗)
+        self.fsbar = FsBar()
+        self.fsbar.prev_btn.clicked.connect(self.prev)
+        self.fsbar.play_btn.clicked.connect(self.toggle)
+        self.fsbar.stop_btn.clicked.connect(self.stop_play)
+        self.fsbar.next_btn.clicked.connect(self.next)
+        self.fsbar.exit_btn.clicked.connect(lambda: self._set_fullscreen(False))
+        self.fsbar.seek.valueChanged.connect(self._fs_seek_moved)
+        self.fsbar.seek.seeked.connect(self._seek_done)
+        self.fsbar.vol.setValue(self.cfg["volume"])
+        self.fsbar.vol.valueChanged.connect(self.vol.setValue)
+        self._fs_timer = QTimer(self)
+        self._fs_timer.setSingleShot(True)
+        self._fs_timer.setInterval(2500)
+        self._fs_timer.timeout.connect(self._fs_idle)
+        self.setAcceptDrops(True)          # 影片檔拖到視窗任何地方都會加進清單並開始播
+        self._hook_video_children()
 
     # ---------------- 外觀 ----------------
     def apply_theme(self):
@@ -3310,12 +3863,14 @@ class Player(QWidget):
         QDialog {{ background-color: rgb({min(255,r+22)},{min(255,g+22)},{min(255,b+22)}); }}
         QTreeWidget::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid {sub}; background: rgba(0,0,0,60); }}
         QTreeWidget::indicator:checked {{ background: {acc}; border-color: {acc}; }}
+        QTreeWidget::indicator:indeterminate {{ background: {sub}; border-color: {acc}; }}
         QLabel#dtitle {{ font-size: 16px; font-weight: bold; }}
         QLabel#bigclock {{ font-size: 36px; font-weight: bold; }}
         QLabel#wxplace {{ font-size: 15px; font-weight: bold; }}
         QLabel#wxnow {{ font-size: 24px; font-weight: bold; }}
         QPushButton#clockbtn[rep="1"] {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#shufbtn:checked {{ background-color: {acc}; color: #ffffff; }}
+        QPushButton#modebtn[vid="1"] {{ background-color: {acc}; color: #ffffff; }}
         QPushButton#foldbtn {{ font-size: 18px; padding: 0; }}
         QPushButton#drawerbar {{ background-color: rgba(255,255,255,22); border: none; border-radius: 6px; font-size: 13px; padding: 0; min-height: 0; }}
         QPushButton#drawerbar:hover {{ background-color: {acc}; color: #ffffff; }}
@@ -3432,6 +3987,8 @@ class Player(QWidget):
         self.folder_list.blockSignals(True)
         self.folder_list.clear()
         for f, on in self.cfg["folders"].items():
+            if self._is_locked_path(f):
+                continue
             it = QListWidgetItem(f + ('   ⚠ 找不到這個資料夾' if ('\ufffd' in f and not os.path.isdir(f)) else ''))
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(Qt.Checked if on else Qt.Unchecked)
@@ -3464,10 +4021,15 @@ class Player(QWidget):
         self.refresh_tracks()
 
     def refresh_tracks(self):
+        if self.mode == "video":
+            self._v_reload()
+            return
         self.all_tracks = []
         for f, on in self.cfg["folders"].items():
-            if on and os.path.isdir(f):
-                for p in sorted(scan(f)):
+            if on and os.path.isdir(f) and not self._is_locked_path(f):
+                for p in sorted(scan(f, self._exts())):
+                    if self._is_locked_path(p):
+                        continue
                     fid = self.stats.fid(p)
                     self.stats.touch(fid, p)
                     self.all_tracks.append((fid, p))
@@ -3524,10 +4086,11 @@ class Player(QWidget):
         self.close()
 
     # ---------------- 下載音樂 ----------------
-    def open_download(self):
+    def open_download(self, kind=None):
+        kind = kind or ("video" if self.mode == "video" else "music")
         if not self.cfg.get("dl_ack"):
             ok = QMessageBox.question(
-                self, "下載音樂 (進階功能)",
+                self, "下載音樂 / 影片 (進階功能)",
                 "這是進階功能，不保證在每一台電腦都能用 (需要另外下載 yt-dlp 和 ffmpeg，可能被防毒或網路擋住)。\n\n"
                 "下載內容是否符合網站規定與著作權，請自行判斷，使用上的後果由使用者自己負責。\n\n"
                 "要繼續嗎？", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
@@ -3536,15 +4099,24 @@ class Player(QWidget):
             self.cfg["dl_ack"] = True
             save_cfg(self.cfg)
         if self._dl_dlg is None:
-            self._dl_dlg = DownloadDialog(self)
+            self._dl_dlg = DownloadDialog(self, kind)
+        else:
+            self._dl_dlg.set_kind(kind)
         self._dl_dlg.show()
         self._dl_dlg.raise_()
         self._dl_dlg.activateWindow()
         QTimer.singleShot(300, self._dl_dlg.ensure_tools)      # 缺 yt-dlp / ffmpeg 就自動下載
 
-    def after_download(self, path):
+    def after_download(self, path, kind="music"):
         """下載完成: 資料夾還沒在清單裡就加進去 (已被勾選的上層資料夾涵蓋就不用)，然後重新掃描"""
         path = os.path.normpath(path)
+        if kind == "video":
+            if self.mode == "video":
+                self._v_add_paths([path])
+            elif not any(path == f or self._v_under(path, f) for f in self.cfg["video_folders"]):
+                self.cfg["video_folders"].append(path)      # 目前在音樂模式: 先記下來，切到影片就看得到
+                save_cfg(self.cfg)
+            return
         key = os.path.normcase(path)
         covered = any(on and (key == os.path.normcase(f) or key.startswith(os.path.normcase(f) + os.sep))
                       for f, on in self.cfg["folders"].items())
@@ -3629,6 +4201,9 @@ class Player(QWidget):
         self.apply_sort()
 
     def apply_sort(self):
+        if self.mode == "video":
+            self._v_filter()
+            return
         mode = self.cfg["sort"]
         q = self.search.text().strip().lower()
         items = [t for t in self.tracks if q in os.path.basename(t[1]).lower()]
@@ -3639,6 +4214,11 @@ class Player(QWidget):
             items.sort(key=lambda t: -self.stats.recent_count(t[0]))
         elif mode == "最近播放":
             items.sort(key=lambda t: -info[t[0]][2])
+        elif mode == RECENT_SORT:
+            cutoff = time.time() - RECENT_DAYS * 86400                     # 只留最近 7 天內新增的，新的排前面；超過一週自動消失
+            added = {p: self._added_cache.setdefault(p, added_time(p)) for _, p in items}      # 用路徑判斷 (內容一樣的兩個檔案也各算各的)
+            items = [t for t in items if added[t[1]] >= cutoff]
+            items.sort(key=lambda t: -added[t[1]])
         elif mode == "從沒聽過":
             items = [t for t in items if info[t[0]][0] == 0]
         elif mode == "跳過最多":
@@ -3666,15 +4246,23 @@ class Player(QWidget):
             self._finish_current(skipped=True)
         fid, path = self.view[idx]
         try:
-            pygame.mixer.music.load(path)
-            pygame.mixer.music.play()
+            if self.mode == "video":
+                url = QUrl.fromLocalFile(path)
+                if self.vplayer.source() == url:          # 同一部再播一次 (單曲循環): 回到開頭
+                    self.vplayer.setPosition(0)
+                else:
+                    self.vplayer.setSource(url)
+                self.vplayer.play()
+            else:
+                pygame.mixer.music.load(path)
+                pygame.mixer.music.play()
         except Exception as e:
             self.now_lbl.setText(f"無法播放: {os.path.basename(path)} ({e})")
             return
         self.cur, self.play_start, self.last_tick = (fid, path), 0.0, time.time()
         self.counted = self.paused = False
         self.pos = 0.0
-        self.length = track_length(path)
+        self.length = 0.0 if self.mode == "video" else track_length(path)      # 影片長度等播放器讀到再填
         self.tot_lbl.setText(fmt(self.length) if self.length else "--:--")
         self.seek.blockSignals(True)
         self.seek.setValue(0)
@@ -3683,13 +4271,19 @@ class Player(QWidget):
         if getattr(self, "tray", None):
             self.tray.setToolTip(os.path.splitext(os.path.basename(path))[0][:60])
         self._slide_on_song()
-        it = self.tree.topLevelItem(idx)
-        if it:
-            self.tree.setCurrentItem(it)
-            self.tree.scrollToItem(it)
+        if self.mode == "video":
+            self._v_highlight(path)
+            self._hook_video_children()
+            if VIDEO_OK and not self.search.hasFocus():
+                self.video_view.setFocus()
+        else:
+            it = self.tree.topLevelItem(idx)
+            if it:
+                self.tree.setCurrentItem(it)
+                self.tree.scrollToItem(it)
 
     def _finish_current(self, skipped):
-        if self.cur and not self.counted and skipped and self.play_start < SKIP_BEFORE_S:
+        if self.cur and self.mode != "video" and not self.counted and skipped and self.play_start < SKIP_BEFORE_S:
             self.stats.add_skip(self.cur[0])
 
     def _build_drawer(self):
@@ -3872,11 +4466,14 @@ class Player(QWidget):
         return b, st
 
     def _toggle_drawer(self):
-        self.cfg["drawer_open"] = not self.cfg["drawer_open"]
+        if self.mode == "video":                       # 影片模式和音樂模式各自記各自的抽屜開關
+            self._vdrawer_open = not self._vdrawer_open
+        else:
+            self.cfg["drawer_open"] = not self.cfg["drawer_open"]
         self._apply_drawer()
 
     def _apply_drawer(self, animate=True):
-        on = self.cfg["drawer_open"]
+        on = self._vdrawer_open if self.mode == "video" else self.cfg["drawer_open"]
         self.drawer.slide(on, animate)
         self.clock_btn.setProperty("rep", "1" if on else "0")
         self.clock_btn.style().unpolish(self.clock_btn)
@@ -3931,6 +4528,8 @@ class Player(QWidget):
             pygame.mixer.music.fadeout(3000)
         except Exception:
             pass
+        if self.vplayer:
+            self.vplayer.stop()
         self.cur = None
         self.paused = False
         self.now_lbl.setText(f"({why}，已停止播放)")
@@ -3985,7 +4584,7 @@ class Player(QWidget):
         self._speak_t0 = time.time()
         # 報時時把音樂壓低，講完再恢復
         try:
-            pygame.mixer.music.set_volume(self.cfg["volume"] / 100 * 0.25)
+            self._set_play_vol(self.cfg["volume"] / 100 * 0.25)
         except Exception:
             pass
         text = self._time_text(datetime.datetime.now()) + self._weather_phrase(full=daily)
@@ -4003,7 +4602,7 @@ class Player(QWidget):
     def _speak_done(self, code):
         self._speaking = False
         try:
-            pygame.mixer.music.set_volume(self.cfg["volume"] / 100)
+            self._set_play_vol(self.cfg["volume"] / 100)
         except Exception:
             pass
         if code == 5:
@@ -4188,7 +4787,8 @@ class Player(QWidget):
         self._apply_folders_open()
 
     def _apply_folders_open(self):
-        on = self.cfg["folders_open"]
+        on = self.cfg["folders_open"] and self.mode != "video"
+        self.fold_btn.setVisible(self.mode != "video")
         self.left_panel.setVisible(on)      # 收起後，右邊的區塊會自動往左擴張填滿
         self.fold_btn.setToolTip("收起資料夾面板" if on else "展開資料夾面板")
         self.fold_btn.setProperty("rep", "1" if on else "0")
@@ -4223,6 +4823,7 @@ class Player(QWidget):
         if m == 0 and idx == len(self.view) - 1 and not self.shuffle_cb.isChecked():
             self.cur = None            # 清單播完，停止
             self.now_lbl.setText("(清單播放完畢)")
+            self._set_fullscreen(False)
             return
         self.next()
 
@@ -4270,24 +4871,830 @@ class Player(QWidget):
 
     def toggle(self):
         if not self.cur:
+            if self.mode == "video":
+                it = self.vtree.currentItem()
+                p = it.data(0, Qt.UserRole) if it is not None and it.data(0, Qt.UserRole + 2) == "file" else None
+                self.play_index(next((i for i, (_, vp) in enumerate(self.view) if vp == p), 0))
+                return
             it = self.tree.currentItem()
             self.play_index(it.data(0, Qt.UserRole) if it else 0)
             return
         if self.paused:
-            pygame.mixer.music.unpause()
+            if self.mode == "video":
+                self.vplayer.play()
+            else:
+                pygame.mixer.music.unpause()
             self.last_tick = time.time()
         else:
-            pygame.mixer.music.pause()
+            if self.mode == "video":
+                self.vplayer.pause()
+            else:
+                pygame.mixer.music.pause()
         self.paused = not self.paused
+
+    # ---------------- 影片清單 (資料夾可展開、可勾選、可拖進來) ----------------
+    def _v_fid(self, p):
+        return hashlib.md5(p.encode("utf-8", "ignore")).hexdigest()       # 影片很大，不讀檔內容，用路徑當編號
+
+    def _v_make(self, kind, path, name, count=0):
+        it = QTreeWidgetItem()
+        it.setData(0, Qt.UserRole, path)
+        it.setData(0, Qt.UserRole + 1, name)
+        it.setData(0, Qt.UserRole + 2, kind)          # file / dir / root / files
+        it.setData(0, Qt.UserRole + 3, count)
+        if not path.startswith("::"):
+            it.setToolTip(0, path)
+        fl = it.flags() | Qt.ItemIsUserCheckable
+        if kind == "file":
+            it.setText(0, name)
+        else:
+            fl |= Qt.ItemIsAutoTristate               # 勾資料夾 = 底下全勾，只勾一部分 = 半勾
+        it.setFlags(fl)
+        it.setCheckState(0, Qt.Checked)
+        return it
+
+    def _v_collect(self, folder, depth=0):
+        """掃資料夾: 回傳 (子資料夾們, 影片們, 影片總數)；裡面完全沒有影片就回 None"""
+        try:
+            ents = sorted(os.scandir(folder), key=lambda e: e.name.lower())
+        except OSError:
+            return None
+        dirs, vids, total = [], [], 0
+        for e in ents:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if self._is_locked_path(e.path):
+                        continue
+                    sub = self._v_collect(e.path, depth + 1) if depth < 12 else None
+                    if sub:
+                        dirs.append((e.name, e.path, sub))
+                        total += sub[2]
+                elif e.name.lower().endswith(VIDEO_EXTS) and e.is_file():
+                    vids.append((e.name, e.path))
+            except OSError:
+                pass
+        total += len(vids)
+        return (dirs, vids, total) if total else None
+
+    def _v_leaf(self, parent, path, name, off):
+        f = self._v_make("file", path, name)
+        parent.addChild(f)
+        if path in off:
+            f.setCheckState(0, Qt.Unchecked)
+        self._v_items[path] = f
+
+    def _v_fill(self, parent, data, off):
+        dirs, vids, _ = data
+        for name, path, sub in dirs:
+            d = self._v_make("dir", path, name, sub[2])
+            parent.addChild(d)
+            self._v_fill(d, sub, off)
+        for name, path in vids:
+            self._v_leaf(parent, path, os.path.splitext(name)[0], off)
+
+    def _v_dirs(self):
+        st = [self.vtree.topLevelItem(i) for i in range(self.vtree.topLevelItemCount())]
+        while st:
+            it = st.pop()
+            if it.data(0, Qt.UserRole + 2) != "file":
+                yield it
+                st.extend(it.child(i) for i in range(it.childCount()))
+
+    def _v_label(self, it):
+        kind = it.data(0, Qt.UserRole + 2)
+        if kind == "file":
+            return
+        arrow = "▾" if it.isExpanded() else "▸"
+        warn = "   ⚠ 找不到這個資料夾" if kind == "root" and not os.path.isdir(it.data(0, Qt.UserRole)) else ""
+        it.setText(0, f"{arrow} 📁 {it.data(0, Qt.UserRole + 1)}  ({it.data(0, Qt.UserRole + 3)}){warn}")
+
+    def _v_reload(self):
+        """重新掃描影片資料夾，重建清單 (勾選狀態、展開狀態都會保留)"""
+        if self.cfg["video_open"] is None:
+            self._v_open |= set(self.cfg["video_folders"])        # 第一次: 頂層資料夾預設展開
+            self.cfg["video_open"] = sorted(self._v_open)
+        t = self.vtree
+        t.blockSignals(True)
+        t.clear()
+        self._v_items = {}
+        off = set(self.cfg["video_off"])
+        for f in self.cfg["video_folders"]:
+            if self._is_locked_path(f):
+                continue
+            data = self._v_collect(f) if os.path.isdir(f) else None
+            r = self._v_make("root", f, f, data[2] if data else 0)
+            t.addTopLevelItem(r)
+            if data:
+                self._v_fill(r, data, off)
+        files = [p for p in self.cfg["video_files"] if os.path.isfile(p) and not self._is_locked_path(p)]
+        if files:
+            r = self._v_make("files", "::files", "單獨加入的影片", len(files))
+            t.addTopLevelItem(r)
+            for p in files:
+                self._v_leaf(r, p, os.path.splitext(os.path.basename(p))[0], off)
+        t.blockSignals(False)
+        t.blockSignals(True)                      # 展開時不要觸發存檔，最後統一整理
+        for it in self._v_dirs():
+            it.setExpanded(it.data(0, Qt.UserRole) in self._v_open)
+            self._v_label(it)
+        t.blockSignals(False)
+        self._v_filter()
+
+    def _v_filter(self):
+        """搜尋框: 只留下名稱有符合的影片 (資料夾自動展開)；然後重新算「要播的清單」"""
+        q = self.search.text().strip().lower()
+
+        def walk(it):
+            if it.data(0, Qt.UserRole + 2) == "file":
+                ok = (not q) or q in os.path.basename(it.data(0, Qt.UserRole)).lower()
+            else:
+                ok = False
+                for i in range(it.childCount()):
+                    if walk(it.child(i)):
+                        ok = True
+                if q and ok:
+                    it.setExpanded(True)
+                    self._v_label(it)
+                ok = ok or not q
+            it.setHidden(not ok)
+            return ok
+
+        self.vtree.setUpdatesEnabled(False)
+        for i in range(self.vtree.topLevelItemCount()):
+            walk(self.vtree.topLevelItem(i))
+        self.vtree.setUpdatesEnabled(True)
+        self._v_commit()
+
+    def _v_commit(self):
+        """依照勾選狀態重算播放清單 (self.view)，並把「沒勾的影片」存起來"""
+        view, off, total = [], [], [0]
+
+        def walk(it):
+            if it.data(0, Qt.UserRole + 2) == "file":
+                total[0] += 1
+                p = it.data(0, Qt.UserRole)
+                if it.checkState(0) != Qt.Checked:
+                    off.append(p)
+                elif not it.isHidden():
+                    view.append((self._v_fid(p), p))
+            else:
+                for i in range(it.childCount()):
+                    walk(it.child(i))
+
+        for i in range(self.vtree.topLevelItemCount()):
+            walk(self.vtree.topLevelItem(i))
+        self.view = view
+        self.cfg["video_off"] = off
+        save_cfg(self.cfg)
+        if total[0]:
+            self.v_count_lbl.setText(f"　已勾選 {total[0] - len(off)} / 共 {total[0]} 部")
+        else:
+            self.v_count_lbl.setText("　把影片資料夾拖進這個清單，或按「＋ 加入資料夾」")
+
+    def _v_set_all(self, on):
+        for i in range(self.vtree.topLevelItemCount()):
+            self.vtree.topLevelItem(i).setCheckState(0, Qt.Checked if on else Qt.Unchecked)
+        self._v_commit()
+
+    def _v_expand_changed(self, it):
+        p = it.data(0, Qt.UserRole)
+        (self._v_open.add if it.isExpanded() else self._v_open.discard)(p)
+        self.cfg["video_open"] = sorted(self._v_open)
+        self._v_label(it)
+
+    def _v_clicked(self, it, _c):
+        """點影片名稱 = 播放；點資料夾 = 展開 / 收合；點最左邊的勾選框 = 只勾選，不播放"""
+        pos = self.vtree.viewport().mapFromGlobal(QCursor.pos())
+        if pos.x() <= self.vtree.visualItemRect(it).left() + 30:
+            return
+        now = time.time()
+        last_it, last_t = self._v_last
+        self._v_last = (it, now)
+        if last_it is it and now - last_t < QApplication.doubleClickInterval() / 1000:
+            return                                  # 雙擊的第二下，不要重複動作
+        if it.data(0, Qt.UserRole + 2) != "file":
+            it.setExpanded(not it.isExpanded())
+            return
+        if it.checkState(0) != Qt.Checked:          # 點到沒勾的影片: 順便幫你勾起來
+            it.setCheckState(0, Qt.Checked)
+            self._v_commit()
+        p = it.data(0, Qt.UserRole)
+        for i, (_, vp) in enumerate(self.view):
+            if vp == p:
+                self.play_index(i)
+                return
+
+    def _v_highlight(self, path):
+        it = self._v_items.get(path)
+        if it is None:
+            return
+        p = it.parent()
+        while p is not None:
+            p.setExpanded(True)
+            p = p.parent()
+        self.vtree.setCurrentItem(it)
+        self.vtree.scrollToItem(it)
+
+    @staticmethod
+    def _v_under(p, folder):
+        a, b = os.path.normcase(p), os.path.normcase(folder).rstrip("\\/")
+        return a.startswith(b + os.sep)
+
+    def _v_add_paths(self, paths, expand=True):
+        """把拖進來 / 選到的資料夾與影片檔加進清單 (資料夾會自動展開)"""
+        if self.cfg["video_open"] is None:
+            self._v_open |= set(self.cfg["video_folders"])
+        for p in paths:
+            p = os.path.normpath(p)
+            if os.path.isdir(p):
+                if any(p == f or self._v_under(p, f) for f in self.cfg["video_folders"]):
+                    pass                                      # 已經在清單裡 (或在某個已加入的資料夾裡面)
+                else:
+                    self.cfg["video_folders"].append(p)
+                if expand:
+                    self._v_open.add(p)
+            elif p.lower().endswith(VIDEO_EXTS) and os.path.isfile(p):
+                if p not in self.cfg["video_files"] and not any(self._v_under(p, f) for f in self.cfg["video_folders"]):
+                    self.cfg["video_files"].append(p)
+                self.cfg["video_off"] = [x for x in self.cfg["video_off"] if x != p]
+        self.cfg["video_open"] = sorted(self._v_open)
+        save_cfg(self.cfg)
+        self._v_reload()
+
+    def _v_add_dialog(self):
+        d = QFileDialog.getExistingDirectory(self, "選擇影片資料夾")
+        if d:
+            self._v_add_paths([d])
+
+    def _v_add_files_dialog(self):
+        fs, _ = QFileDialog.getOpenFileNames(self, "選擇影片檔", "", "影片 (" + " ".join("*" + e for e in VIDEO_EXTS) + ")")
+        if fs:
+            self._v_add_paths(fs)
+
+    def _v_menu(self, pos):
+        it = self.vtree.itemAt(pos)
+        if it is None:
+            return
+        kind, path = it.data(0, Qt.UserRole + 2), it.data(0, Qt.UserRole)
+        m = QMenu(self)
+        if kind == "root":
+            m.addAction("從清單移除這個資料夾 (不會刪檔案)", lambda: self._v_remove("video_folders", path))
+        elif kind == "files":
+            m.addAction("清除所有單獨加入的影片 (不會刪檔案)", lambda: self._v_remove("video_files", None))
+        elif kind == "file" and path in self.cfg["video_files"]:
+            m.addAction("從清單移除這部影片 (不會刪檔案)", lambda: self._v_remove("video_files", path))
+        if m.isEmpty():
+            return
+        m.exec(self.vtree.viewport().mapToGlobal(pos))
+
+    def _v_remove(self, key, path):
+        self.cfg[key] = [] if path is None else [x for x in self.cfg[key] if x != path]
+        save_cfg(self.cfg)
+        self._v_reload()
+
+    def _v_meta(self):
+        """播放器讀到影片資料後，把解析度顯示在歌名那一行"""
+        if self.mode != "video" or not self.cur:
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaMetaData
+            r = self.vplayer.metaData().value(QMediaMetaData.Key.Resolution)
+            if r is not None and r.width() > 0:
+                self.now_lbl.setText("正在播放: " + os.path.splitext(os.path.basename(self.cur[1]))[0] + f"   [{r.width()}×{r.height()}]")
+        except Exception:
+            pass
+
+    # ---------------- 音樂 / 影片 模式 ----------------
+    def _exts(self):
+        return VIDEO_EXTS if self.mode == "video" else EXTS
+
+    def _toggle_mode(self):
+        self.set_mode("music" if self.mode == "video" else "video")
+
+    def set_mode(self, mode, first=False):
+        """切換音樂 / 影片模式: 先停掉現在播的，換清單 (同樣的勾選資料夾)，影片模式會多出畫面。"""
+        if mode == "video" and not VIDEO_OK:
+            QMessageBox.information(self, "無法播放影片", "這台電腦的 PySide6 沒有 QtMultimedia 模組。\n請執行:  pip install PySide6-Addons")
+            mode = "music"
+        if not first and mode == self.mode:
+            return
+        if not first:
+            self._stop_all()
+            self.cur, self.paused, self.pos, self.length = None, False, 0.0, 0.0
+        self.mode = mode
+        self.cfg["mode"] = mode
+        vid = mode == "video"
+        self.video_panel.setVisible(vid)
+        self.mode_btn.setText("🎬 影片" if vid else "🎵 音樂")
+        self.mode_btn.setToolTip("目前是影片播放器，點一下切回音樂" if vid else "目前是音樂播放器，點一下切換成影片")
+        self.mode_btn.setProperty("vid", "1" if vid else "0")
+        self.mode_btn.style().unpolish(self.mode_btn)
+        self.mode_btn.style().polish(self.mode_btn)
+        self.tree.headerItem().setText(1, "影片名稱" if vid else "歌名")
+        self.tree.setVisible(not vid)                    # 影片模式沒有排行榜，改用可勾選的資料夾清單
+        self.video_box.setVisible(vid)
+        self.sort_cb.setVisible(not vid)
+        self.sort_lbl.setVisible(not vid)
+        self.cold_btn.setVisible(not vid)
+        self.stop_btn.setVisible(vid)
+        self.list_btn.setVisible(vid)
+        self.fs_btn.setVisible(vid and VIDEO_OK)
+        self.tool_r2w.setVisible(not vid)            # 影片模式: 收起背景 / 桌布那一排，畫面更大
+        self._apply_video_layout()
+        self._apply_drawer(animate=not first)             # 進影片模式: 抽屜自動收起來，把空間讓給畫面；回音樂模式: 恢復原本的開關
+        if vid:
+            self._hook_video_children()
+        self._apply_folders_open()
+        self.search.setPlaceholderText("輸入影片名稱關鍵字" if vid else "輸入歌名關鍵字")
+        self.now_lbl.setText("(未播放)")
+        if not first:
+            self.search.blockSignals(True)
+            self.search.setText("")
+            self.search.blockSignals(False)
+            save_cfg(self.cfg)
+            self.refresh_tracks()
+
+    # ---------------- 影片介面 (像 MPC-HC) ----------------
+    def _apply_video_layout(self):
+        """影片模式: 左邊大畫面、右邊清單 (可收合)；音樂模式: 清單佔滿"""
+        vid = self.mode == "video"
+        self.mid.setDirection(QBoxLayout.LeftToRight if vid else QBoxLayout.TopToBottom)
+        if vid:
+            self.listp.setFixedWidth(max(340, self.listp.minimumSizeHint().width() + 20))     # 清單窄一點 (但不小於上面那排按鈕需要的寬度)
+            self.listp.setVisible(bool(self.cfg["video_list_on"]))
+        else:
+            self.listp.setMinimumWidth(0)
+            self.listp.setMaximumWidth(16777215)
+            self.listp.setVisible(True)
+
+    def _toggle_vlist(self, on):
+        self.cfg["video_list_on"] = bool(on)
+        save_cfg(self.cfg)
+        self._apply_video_layout()
+
+    # ---------------- 資料夾鎖 (播放器內密碼鎖 + 硬碟隱藏) ----------------
+    def _lock_norm(self):
+        return [os.path.normcase(os.path.normpath(p)) for p in self.cfg["lock"]["folders"]]
+
+    def _is_locked_path(self, p):
+        """這個路徑在被鎖的資料夾裡 (或就是它)，而且目前沒有解鎖 → True，掃描時要略過"""
+        if self._unlocked or not self.cfg["lock"]["folders"]:
+            return False
+        k = os.path.normcase(os.path.normpath(p))
+        for f in self._lock_norm():
+            if k == f or k.startswith(f.rstrip("\\/") + os.sep):
+                return True
+        return False
+
+    def _pw_ok(self, pw):
+        import hmac
+        L = self.cfg["lock"]
+        if not L["salt"] or not L["hash"]:
+            return False
+        return hmac.compare_digest(_pw_hash(pw, bytes.fromhex(L["salt"])), L["hash"])
+
+    def _ask_pw(self, title, text):
+        pw, ok = QInputDialog.getText(self, title, text, QLineEdit.EchoMode.Password)
+        return pw if ok else None
+
+    def _lock_new_pw(self):
+        a = self._ask_pw("設定密碼", "請設定一組密碼 (之後解鎖都要用它，忘記了沒辦法找回):")
+        if not a:
+            return False
+        b = self._ask_pw("設定密碼", "再輸入一次確認:")
+        if b is None:
+            return False
+        if a != b:
+            QMessageBox.warning(self, "密碼不一樣", "兩次輸入的密碼不一樣，沒有設定。")
+            return False
+        salt = os.urandom(16)
+        self.cfg["lock"]["salt"] = salt.hex()
+        self.cfg["lock"]["hash"] = _pw_hash(a, salt)
+        save_cfg(self.cfg)
+        return True
+
+    def _lock_ask_verify(self):
+        """問密碼。對了才回傳 True；按「忘記密碼」會走強制解除 (做完一律回傳 False，呼叫的人不用再往下做)"""
+        dlg = PwDialog(self, "輸入密碼", "請輸入密碼:")
+        ok = dlg.exec()
+        if dlg.forgot:
+            self._lock_force_reset()
+            return False
+        if not ok:
+            return False
+        if self._pw_ok(dlg.text()):
+            return True
+        QMessageBox.warning(self, "密碼不對", "密碼不正確。\n如果忘記了，輸入密碼時按左下角的「🆘 忘記密碼」就可以解除鎖定。")
+        return False
+
+    def _lock_force_reset(self):
+        """忘記密碼: 不用密碼，直接解除全部鎖定、清掉密碼，硬碟上的隱藏也恢復"""
+        L = self.cfg["lock"]
+        n = len(L["folders"])
+        ans = QMessageBox.question(
+            self, "忘記密碼",
+            (f"要解除全部 {n} 個資料夾的鎖定，並且清掉密碼嗎？\n\n" if n else "目前沒有鎖定任何資料夾，要把密碼清掉嗎？\n\n")
+            + "• 被鎖的資料夾會重新出現在清單裡\n• 硬碟上的隱藏會恢復\n• 之後想再鎖，要重新設一組新密碼\n\n"
+              "注意：這樣任何人打開播放器都能解除鎖定。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ans != QMessageBox.Yes:
+            return
+        for p in list(L["folders"]):
+            if os.path.isdir(p):
+                restore_on_disk(p, L["orig"].get(p, 0))
+        L["folders"], L["orig"], L["salt"], L["hash"] = [], {}, "", ""
+        save_cfg(self.cfg)
+        self._unlocked = False
+        self._lock_refresh()
+        QMessageBox.information(self, "資料夾鎖", "已解除全部鎖定，密碼也清掉了。")
+
+    def _lock_change_pw(self):
+        if self._lock_ask_verify():
+            self._lock_new_pw()
+
+    def _lock_auth(self):
+        """要管理鎖之前: 還沒設密碼就先設一個；已經設了就要先輸入密碼 (這次已解鎖就免)"""
+        if not self.cfg["lock"]["hash"]:
+            return self._lock_new_pw()
+        return True if self._unlocked else self._lock_ask_verify()
+
+    def _lock_ui(self):
+        n = len(self.cfg["lock"]["folders"])
+        for b in getattr(self, "_lock_btns", []):
+            b.setText("🔒 重新上鎖" if self._unlocked else f"🔓 解鎖 ({n})")
+            b.setEnabled(n > 0 or self._unlocked)
+            b.setToolTip("按一下立刻把鎖定的資料夾藏起來" if self._unlocked else "輸入密碼，這次執行期間看得到被鎖的資料夾")
+
+    def _lock_refresh(self):
+        if self.cur and self._is_locked_path(self.cur[1]):
+            self.stop_play()                       # 正在播的就是被鎖的內容: 先停掉
+        self._load_folders()
+        self.refresh_tracks()
+        self._lock_ui()
+
+    def _lock_toggle(self):
+        if self._unlocked:
+            self._unlocked = False
+            self._lock_refresh()
+            return
+        if not self.cfg["lock"]["folders"]:
+            QMessageBox.information(self, "資料夾鎖", "還沒有鎖定任何資料夾。\n請先按「⚙ 鎖定設定…」，打勾要鎖的資料夾。")
+            return
+        if self._lock_ask_verify():
+            self._unlocked = True
+            self._lock_refresh()
+
+    def lock_manage(self):
+        if not self._lock_auth():
+            return
+        seen, paths = set(), []
+        for p in list(self.cfg["folders"]) + list(self.cfg["video_folders"]) + list(self.cfg["lock"]["folders"]):
+            p = os.path.normpath(p)
+            if os.path.normcase(p) not in seen:
+                seen.add(os.path.normcase(p))
+                paths.append(p)
+        if not paths:
+            QMessageBox.information(self, "資料夾鎖", "清單裡還沒有資料夾，請先把音樂或影片資料夾加進清單。")
+            return
+        dlg = LockDialog(self, paths, set(self._lock_norm()), self._lock_change_pw)
+        if dlg.exec():
+            self._lock_apply(dlg.checked())
+
+    def _lock_apply(self, checked):
+        L = self.cfg["lock"]
+        old = {os.path.normcase(os.path.normpath(p)): os.path.normpath(p) for p in L["folders"]}
+        new = {os.path.normcase(os.path.normpath(p)): os.path.normpath(p) for p in checked}
+        added = [new[k] for k in new if k not in old]
+        removed = [old[k] for k in old if k not in new]
+        bad = []
+        for p in added:                                  # 新鎖的: 硬碟上設成隱藏，記下原本的狀態
+            if os.path.isdir(p):
+                ok, bits = hide_on_disk(p)
+                L["orig"][p] = bits
+                if not ok:
+                    bad.append(p)
+        for p in removed:                                # 解除的: 硬碟上的隱藏恢復成原本的樣子
+            if os.path.isdir(p):
+                restore_on_disk(p, L["orig"].get(p, 0))
+            L["orig"].pop(p, None)
+        L["folders"] = list(new.values())
+        save_cfg(self.cfg)
+        if added or not L["folders"]:
+            self._unlocked = False                       # 剛鎖好的資料夾，馬上就藏起來
+        self._lock_refresh()
+        msg = []
+        if added:
+            msg.append(f"已鎖定 {len(added)} 個資料夾。需要看的時候按「🔓 解鎖」輸入密碼。")
+        if removed:
+            msg.append(f"已解除 {len(removed)} 個資料夾的鎖定。")
+        if bad and IS_WIN:
+            msg.append("這幾個資料夾無法在硬碟上設成隱藏 (可能權限不足)，但在播放器裡一樣是鎖住的:\n" + "\n".join(bad))
+        if msg:
+            QMessageBox.information(self, "資料夾鎖", "\n\n".join(msg))
+
+    def _toggle_search(self):
+        self.cfg["search_open"] = not self.cfg["search_open"]
+        save_cfg(self.cfg)
+        if not self.cfg["search_open"]:
+            self.search.setText("")                 # 收起來的時候一併清掉關鍵字，清單恢復完整
+        self._apply_search()
+        if self.cfg["search_open"]:
+            self.search.setFocus()
+
+    def _apply_search(self):
+        on = bool(self.cfg["search_open"])
+        self.search_lbl.setVisible(on)
+        self.search.setVisible(on)
+        self.search_btn.setToolTip("收起搜尋列" if on else "展開搜尋列")
+        self.search_btn.setProperty("rep", "1" if on else "0")
+        self.search_btn.style().unpolish(self.search_btn)
+        self.search_btn.style().polish(self.search_btn)
+
+    def _toggle_vtools(self):
+        self.cfg["video_tools_open"] = not self.cfg["video_tools_open"]
+        save_cfg(self.cfg)
+        self._apply_vtools()
+
+    def _apply_vtools(self):
+        on = bool(self.cfg["video_tools_open"])
+        self.v_tools_bar.setText("▼" if on else "▲")
+        self.v_tools_bar.setToolTip("收起下面的按鈕" if on else "展開下面的按鈕 (下載影片…)")
+        self.v_tools_box.setVisible(on)
+
+    def _autopause_changed(self, on):
+        self.cfg["auto_pause"] = bool(on)
+        save_cfg(self.cfg)
+
+    def _app_state(self, st):
+        """切到別的程式 / 縮小到工作列 / 縮進系統匣: 正在放的影片自動暫停 (回來後要自己按播放)"""
+        if st == Qt.ApplicationActive:
+            return
+        if self.mode == "video" and self.cur and not self.paused and self.cfg["auto_pause"]:
+            self.toggle()
+
+    def stop_play(self):
+        """⏹ 停止: 停掉現在播的，畫面與進度條歸零 (清單不動)"""
+        self._stop_all()
+        self.cur, self.paused, self.pos, self.length = None, False, 0.0, 0.0
+        self.now_lbl.setText("(未播放)")
+
+    def _toggle_fullscreen(self):
+        if VIDEO_OK and self.mode == "video":
+            self._set_fullscreen(not self.video_view.isFullScreen())
+
+    def _set_fullscreen(self, on):
+        if not VIDEO_OK:
+            return
+        vv = self.video_view
+        if on and self.mode != "video":
+            return
+        if vv.isFullScreen() != on:
+            vv.setFullScreen(on)
+        if on:
+            vv.setFocus()
+            self._fs_show_bar()
+            self._fs_timer.start()
+        else:
+            self._fs_timer.stop()
+            self.fsbar.hide()
+            vv.unsetCursor()
+            if self.mode == "video":
+                vv.setFocus()
+
+    def _fs_show_bar(self):
+        scr = self.video_view.screen() or QApplication.primaryScreen()
+        g = scr.geometry()
+        b = self.fsbar
+        b.style_it(getattr(self, "th", {}).get("accent", "#5865f2"))
+        b.setGeometry(g.x(), g.y() + g.height() - b.height(), g.width(), b.height())
+        b.show()
+        b.raise_()
+        self._fs_sync()
+
+    def _fs_motion(self):
+        """全螢幕時滑鼠一動: 叫出控制列和滑鼠游標，一陣子沒動再收起來"""
+        if not (VIDEO_OK and self.video_view.isFullScreen()):
+            return
+        self.video_view.unsetCursor()
+        if not self.fsbar.isVisible():
+            self._fs_show_bar()
+        self._fs_timer.start()
+
+    def _fs_idle(self):
+        if not (VIDEO_OK and self.video_view.isFullScreen()):
+            return
+        if self.fsbar.underMouse() or self.fsbar.seek.dragging:
+            self._fs_timer.start()                  # 滑鼠還在控制列上，不收
+            return
+        self.fsbar.hide()
+        self.video_view.setCursor(Qt.BlankCursor)
+
+    def _fs_seek_moved(self, v):
+        if self.fsbar.seek.dragging and self.length:
+            self.fsbar.cur_lbl.setText(fmt(v / 1000 * self.length))
+
+    def _fs_sync(self):
+        b = getattr(self, "fsbar", None)
+        if b is None or not b.isVisible():
+            return
+        b.play_btn.setText("▶" if (self.paused or not self.cur) else "❚❚")
+        b.title.setText(os.path.splitext(os.path.basename(self.cur[1]))[0] if self.cur else "(未播放)")
+        if not b.seek.dragging:
+            b.seek.blockSignals(True)
+            if self.cur:
+                b.cur_lbl.setText(fmt(self.pos))
+                b.tot_lbl.setText(fmt(self.length))
+                b.seek.setValue(int(min(1.0, self.pos / self.length) * 1000) if self.length else 0)
+            else:
+                b.cur_lbl.setText("0:00")
+                b.tot_lbl.setText("0:00")
+                b.seek.setValue(0)
+            b.seek.blockSignals(False)
+
+    def _video_key(self, e):
+        """影片畫面的鍵盤 (跟 MPC-HC 一樣): 空白=播放/暫停  F/Enter=全螢幕  Esc=離開全螢幕
+        ←/→=倒退/快轉10秒 (Shift 5秒)  ↑/↓=音量  M=靜音  PgUp/PgDn=上一部/下一部  L=清單"""
+        k = e.key()
+        small = bool(e.modifiers() & Qt.ShiftModifier)
+        if k == Qt.Key_Escape:
+            if self.video_view.isFullScreen():
+                self._set_fullscreen(False)
+                return True
+            return False
+        if k == Qt.Key_Space:
+            self.toggle()
+        elif k in (Qt.Key_F, Qt.Key_Return, Qt.Key_Enter):
+            self._toggle_fullscreen()
+        elif k == Qt.Key_Left:
+            self._seek_rel(-5 if small else -10)
+        elif k == Qt.Key_Right:
+            self._seek_rel(5 if small else 10)
+        elif k == Qt.Key_Up:
+            self.vol.setValue(self.vol.value() + 5)
+        elif k == Qt.Key_Down:
+            self.vol.setValue(self.vol.value() - 5)
+        elif k == Qt.Key_M:
+            if self.vol.value() > 0:
+                self._mute_prev = self.vol.value()
+                self.vol.setValue(0)
+            else:
+                self.vol.setValue(getattr(self, "_mute_prev", 70) or 70)
+        elif k == Qt.Key_PageUp:
+            self.prev()
+        elif k == Qt.Key_PageDown:
+            self.next()
+        elif k == Qt.Key_L and not self.video_view.isFullScreen():
+            self.list_btn.toggle()
+        else:
+            return False
+        return True
+
+    def _video_wheel(self, dy):
+        self.vol.setValue(self.vol.value() + (5 if dy > 0 else -5))
+        return True
+
+    # ---- 直接把影片拖進播放器 ----
+    def _v_play_path(self, path):
+        """播這一部影片: 先在清單裡找 (大小寫不分)；找不到 (被濾掉、副檔名不在清單支援內…) 就臨時加到清單最前面照播"""
+        path = os.path.normpath(path)
+        key = os.path.normcase(path)
+        for i, (_, vp) in enumerate(self.view):
+            if os.path.normcase(vp) == key:
+                self.play_index(i)
+                return True
+        if not os.path.isfile(path):
+            return False
+        self.view.insert(0, (self._v_fid(path), path))
+        self.play_index(0)
+        return True
+
+    def _v_drop_play(self, paths):
+        """影片檔 / 資料夾拖進來: 加進清單，並且馬上開始播第一部"""
+        try:
+            if self.mode != "video":
+                self.set_mode("video")
+                if self.mode != "video":
+                    return
+            paths = [os.path.normpath(p) for p in paths if p]
+            if self.search.text():
+                self.search.setText("")             # 清掉搜尋，免得新加的影片被濾掉
+            self._v_add_paths(paths)
+            first = next((p for p in paths if os.path.isfile(p) and p.lower().endswith(VIDEO_EXTS)), None)
+            if first is None:
+                for p in paths:
+                    if os.path.isdir(p):
+                        first = next((vp for _, vp in self.view if self._v_under(vp, p)), None)
+                        if first:
+                            break
+            if first is None:
+                first = next((p for p in paths if os.path.isfile(p)), None)     # 副檔名不認得: 照樣試著播，交給解碼器決定
+            if first is None:
+                self.now_lbl.setText("拖進來的東西裡找不到影片檔")
+                return
+            if not self._v_play_path(first):
+                self.now_lbl.setText("無法播放: " + os.path.basename(first))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.now_lbl.setText(f"拖進來播放失敗: {e}")
+
+    def _hook_video_children(self):
+        """QVideoWidget 裡面還有自己的畫面元件蓋在上面，拖放有時會被它吃掉。
+        把畫面和它底下所有元件都登記成可拖放，並用事件過濾器接手，確保把影片拖到黑框框上一定會播"""
+        if not VIDEO_OK:
+            return
+        vv = self.video_view
+        for ch in [vv] + vv.findChildren(QWidget):
+            if not ch.property("_drophook"):
+                ch.setProperty("_drophook", True)
+                ch.setAcceptDrops(True)
+                ch.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        t = ev.type()
+        if t in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop) and obj.property("_drophook"):
+            md = ev.mimeData()
+            if md is not None and md.hasUrls():
+                ev.acceptProposedAction()
+                if t == QEvent.Drop:
+                    paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+                    if paths:
+                        QTimer.singleShot(0, lambda p=paths: self._v_drop_play(p))      # 先讓檔案總管放手，再處理
+                return True
+        return super().eventFilter(obj, ev)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if not paths:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        QTimer.singleShot(0, lambda p=paths: self._handle_drop(p))
+
+    def _handle_drop(self, paths):
+        if self.mode == "video" or any(p.lower().endswith(VIDEO_EXTS) for p in paths):
+            self._v_drop_play(paths)
+        else:
+            self.open_external(paths)
+
+    def _stop_all(self):
+        try:
+            pygame.mixer.music.stop()
+        except Exception:
+            pass
+        if self.vplayer:
+            self._set_fullscreen(False)
+            self.vplayer.stop()
+            self.vplayer.setSource(QUrl())
+
+    def _set_play_vol(self, f):
+        """音量 (0~1): 音樂與影片兩邊一起設，報時壓低音量也一樣"""
+        try:
+            pygame.mixer.music.set_volume(f)
+        except Exception:
+            pass
+        if self.vaudio:
+            self.vaudio.setVolume(f)
+
+    def _v_duration(self, ms):
+        if self.mode == "video" and ms > 0:
+            self.length = ms / 1000
+            self.tot_lbl.setText(fmt(self.length))
+
+    def _v_status(self, st):
+        if self.mode == "video" and self.cur and st == QMediaPlayer.MediaStatus.EndOfMedia:
+            QTimer.singleShot(0, self._auto_next)
+
+    def _v_error(self, err, msg):
+        if self.mode == "video" and self.cur:
+            self.now_lbl.setText(f"無法播放: {os.path.basename(self.cur[1])} ({msg or err})")
 
     def _update_vol_icon(self, v):
         self.vol_btn.setText("🔇" if v == 0 else "🔈" if v < 34 else "🔉" if v < 67 else "🔊")
 
     def _set_vol(self, v):
-        pygame.mixer.music.set_volume(v / 100)
+        self._set_play_vol(v / 100)
         self.vol_lbl.setText(f"{v}%")
         self._update_vol_icon(v)
         self.cfg["volume"] = v
+        fb = getattr(self, "fsbar", None)
+        if fb is not None:
+            fb.vol.blockSignals(True)
+            fb.vol.setValue(v)
+            fb.vol.blockSignals(False)
+            fb.vol_lbl.setText("🔇" if v == 0 else "🔈" if v < 34 else "🔉" if v < 67 else "🔊")
 
     def _show_vol_popup(self):
         b = self.vol_btn
@@ -4309,11 +5716,24 @@ class Player(QWidget):
     def _seek_done(self, v):
         if not self.cur or not self.length:
             return
-        target = max(0.0, min(self.length - 0.5, v / 1000 * self.length))
+        self._seek_to(v / 1000 * self.length)
+
+    def _seek_rel(self, sec):
+        """快轉 / 倒退 sec 秒 (影片模式的左右鍵)"""
+        if self.cur and self.length:
+            self._seek_to(self.pos + sec)
+
+    def _seek_to(self, target):
+        if not self.cur or not self.length:
+            return
+        target = max(0.0, min(self.length - 0.5, target))
         try:
-            pygame.mixer.music.play(start=target)
-            if self.paused:
-                pygame.mixer.music.pause()
+            if self.mode == "video":
+                self.vplayer.setPosition(int(target * 1000))
+            else:
+                pygame.mixer.music.play(start=target)
+                if self.paused:
+                    pygame.mixer.music.pause()
             self.pos = target
             self.last_tick = time.time()
         except Exception as e:
@@ -4325,10 +5745,12 @@ class Player(QWidget):
             dt = now - self.last_tick
             self.play_start += dt
             self.pos += dt
-            if not self.counted and self.play_start >= COUNT_AFTER_S:
+            if not self.counted and self.mode != "video" and self.play_start >= COUNT_AFTER_S:
                 self.counted = True
                 self.stats.add_play(self.cur[0])
-            if not pygame.mixer.music.get_busy():
+            if self.mode == "video":
+                self.pos = self.vplayer.position() / 1000      # 影片的進度直接問播放器 (播完由 _v_status 通知)
+            elif not pygame.mixer.music.get_busy():
                 self._auto_next()
         self.last_tick = now
         self._clock_tick()
@@ -4342,6 +5764,7 @@ class Player(QWidget):
                 self.tot_lbl.setText("0:00")
                 self.seek.setValue(0)
             self.seek.blockSignals(False)
+        self._fs_sync()
 
     def _hotkeys(self):
         self.hot = Hot()
@@ -4385,10 +5808,18 @@ class Player(QWidget):
     # ---------------- 從外面開啟歌曲 / 只開一個播放器 ----------------
     def open_external(self, paths):
         """在檔案總管對一首歌按兩下(或「開啟檔案」)時: 直接播那一首；不在目前清單裡也照播。"""
-        files = [os.path.normpath(p) for p in paths if p and p.lower().endswith(EXTS) and os.path.isfile(p)]
+        files = [os.path.normpath(p) for p in paths if p and p.lower().endswith(EXTS + VIDEO_EXTS) and os.path.isfile(p)]
         if not files:
             return False
         p = files[0]
+        want = "video" if p.lower().endswith(VIDEO_EXTS) else "music"
+        if want != self.mode:
+            self.set_mode(want)
+            if self.mode != want:
+                return False
+        if self.mode == "video":
+            self._v_add_paths([p], expand=False)
+            return self._v_play_path(p)
         fid = self.stats.fid(p)
         self.stats.touch(fid, p)
         self.stats.db.commit()
@@ -4449,6 +5880,15 @@ class Player(QWidget):
         try:
             if self.tray:
                 self.tray.hide()
+        except Exception:
+            pass
+        try:
+            self.fsbar.close()
+        except Exception:
+            pass
+        try:
+            if self.vplayer:
+                self.vplayer.stop()
         except Exception:
             pass
         try:
