@@ -51,14 +51,54 @@ def _pip(pkg):
     return False
 
 
+MM_ERR = ""
+
+
+def _can_import(mod):
+    """真的在另一個行程 import 一次 (find_spec 只看檔案在不在，版本不合或缺 DLL 還是會失敗)"""
+    r = subprocess.run([sys.executable, "-c", f"import {mod}"], capture_output=True, text=True)
+    return r.returncode == 0, (r.stderr or "").strip()[-400:]
+
+
+def _pyside_version():
+    from importlib import metadata
+    for n in ("PySide6-Essentials", "PySide6"):
+        try:
+            return metadata.version(n)
+        except Exception:
+            pass
+    return ""
+
+
+def ensure_multimedia():
+    global MM_ERR
+    ok, err = _can_import("PySide6.QtMultimedia")
+    if ok:
+        return
+    ver = _pyside_version()
+    pin = f"=={ver}" if ver else ""
+    print("正在安裝 / 修復 PySide6-Addons (影片播放要用) ...")
+    _pip(f"PySide6-Addons{pin}")
+    ok, err = _can_import("PySide6.QtMultimedia")
+    if not ok and ver:        # 還是不行: 三個套件用同一版本強制重裝
+        print("版本可能不一致，正在強制重裝 PySide6 全套 ...")
+        for extra in ([], ["--user"]):
+            r = subprocess.run([sys.executable, "-m", "pip", "install", "--force-reinstall",
+                                f"PySide6=={ver}", f"PySide6-Essentials=={ver}", f"PySide6-Addons=={ver}", *extra],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+        ok, err = _can_import("PySide6.QtMultimedia")
+    if not ok:
+        MM_ERR = err
+
+
 def ensure_deps():
     importlib.invalidate_caches()
     if importlib.util.find_spec("PySide6") is None:
         print("正在下載安裝 PySide6 (介面，約 100MB，請稍候) ...")
         _pip("PySide6-Essentials") or _pip("PySide6")
-    if importlib.util.find_spec("PySide6") is not None and importlib.util.find_spec("PySide6.QtMultimedia") is None:
-        print("正在下載安裝 PySide6-Addons (影片播放要用，約 100MB，請稍候) ...")
-        _pip("PySide6-Addons")
+    ensure_multimedia()
     if importlib.util.find_spec("pygame") is None:
         print("正在下載安裝 pygame ...")
         _pip("pygame") or _pip("pygame-ce")
@@ -97,8 +137,9 @@ try:                                    # 影片播放: Qt 的 QtMultimedia (在
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
     from PySide6.QtMultimediaWidgets import QVideoWidget
     VIDEO_OK = True
-except Exception:
+except Exception as _e:
     VIDEO_OK = False
+    MM_ERR = MM_ERR or str(_e)
 
 SCRIPT = os.path.abspath(sys.executable if FROZEN else __file__)     # EXE 版: 這個 EXE 本身
 HERE = os.path.dirname(SCRIPT)
@@ -5174,7 +5215,13 @@ class Player(QWidget):
     def set_mode(self, mode, first=False):
         """切換音樂 / 影片模式: 先停掉現在播的，換清單 (同樣的勾選資料夾)，影片模式會多出畫面。"""
         if mode == "video" and not VIDEO_OK:
-            QMessageBox.information(self, "無法播放影片", "這台電腦的 PySide6 沒有 QtMultimedia 模組。\n請執行:  pip install PySide6-Addons")
+            if FROZEN:
+                why = "這個 EXE 打包時沒有包進 QtMultimedia。\n請用裝好 PySide6-Addons 的環境重新打包，並加上 --hidden-import PySide6.QtMultimedia --hidden-import PySide6.QtMultimediaWidgets。"
+            else:
+                why = "已嘗試自動安裝但還是載入失敗，請關閉播放器後重新開啟一次。"
+            msg = why + (f"\n\n錯誤原因:\n{MM_ERR}" if MM_ERR else "")
+            msg += "\n\n如果你用的是 Windows N / KN 版，要先到「設定 > 應用程式 > 選用功能」安裝「媒體功能套件 (Media Feature Pack)」。"
+            QMessageBox.information(self, "無法播放影片", msg)
             mode = "music"
         if not first and mode == self.mode:
             return
