@@ -26,7 +26,7 @@ def _setup_ssl():
 
 _setup_ssl()
 
-VERSION = 24     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 25     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
 UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
