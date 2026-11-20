@@ -45,6 +45,20 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
+          # 影片播放要用 QtMultimedia (在 PySide6-Addons 裡)。版本一定要跟 PySide6-Essentials 一模一樣。
+          PYSIDE_VER=$(python -c "from importlib import metadata as m; print(m.version('PySide6-Essentials'))" || true)
+          if [ -n "$PYSIDE_VER" ]; then
+            pip install "PySide6-Addons==$PYSIDE_VER"
+          else
+            pip install PySide6-Addons
+          fi
+          pip list | grep -i -E "pyside6|shiboken"
+
+      - name: 確認影片播放模組載得進來 (失敗就停止，不會發佈壞掉的版本)
+        if: steps.v.outputs.exists != 'true'
+        shell: bash
+        run: |
+          python -c "from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput; from PySide6.QtMultimediaWidgets import QVideoWidget; print('multimedia ok')"
 
       - name: 帶入更新來源 (只放進 EXE，不會改到倉庫裡的原始碼)
         if: steps.v.outputs.exists != 'true'
@@ -63,6 +77,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --onefile --noconsole --name TruckPlayer --icon icon.ico \
             --hidden-import mutagen --hidden-import keyboard \
+            --hidden-import PySide6.QtMultimedia --hidden-import PySide6.QtMultimediaWidgets \
             --collect-submodules edge_tts --hidden-import aiohttp --collect-data certifi \
             ets2_player_qt.py
           ls -l dist
