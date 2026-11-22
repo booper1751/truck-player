@@ -27,10 +27,10 @@ def _setup_ssl():
 
 _setup_ssl()
 
-VERSION = 30     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 31 # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
-UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
+UPDATE_CHECK_MIN = 31      # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
 
 FROZEN = bool(getattr(sys, "frozen", False))      # True = 打包成 EXE 後執行
 APP_NAME = "卡車播放器"
@@ -477,6 +477,7 @@ def load_cfg():
     c.setdefault("dl_playlist", True)
     c.setdefault("dl_aria2", True)
     c.setdefault("shuffle", False)         # 亂跳(隨機)模式是否開啟
+    c.setdefault("shuffle_mode", "even")   # 亂跳怎麼抽: even=每首一樣 / hot=常聽的較常抽到 / cold=不常聽的較常抽到
     c.setdefault("update_src", "")         # 更新來源: GitHub 檔案網址 或 帳號/倉庫
     c.setdefault("update_auto", True)      # 啟動時自動檢查更新
     c.setdefault("update_skip", 0)         # 使用者按「稍後」略過的版本號 (不再自動提示這一版)
@@ -521,6 +522,8 @@ def load_cfg():
     c.setdefault("video_sort", "name")     # 影片模式: 清單排序 name=名稱 / size_desc=大→小 / size_asc=小→大
     if c["mode"] not in ("music", "video"):
         c["mode"] = "music"
+    if c["shuffle_mode"] not in ("even", "hot", "cold", "explore"):
+        c["shuffle_mode"] = "even"
     if c["video_sort"] not in [k for k, _ in V_SORTS]:
         c["video_sort"] = "name"
     if c["theme"] not in THEMES:
@@ -3675,6 +3678,12 @@ class FsBar(QFrame):
         """)
 
 
+class CycleButton(QPushButton):
+    """可以亮 / 不亮的按鈕，但按下去不會自己切換，下一個狀態由程式決定 (亂跳按鈕用)"""
+    def nextCheckState(self):
+        pass
+
+
 class Player(QWidget):
     def __init__(self):
         super().__init__()
@@ -4105,7 +4114,9 @@ class Player(QWidget):
         f.setBold(True)
         self.now_lbl.setFont(f)
         bv.addWidget(self.now_lbl)
+        # 一排: 左邊是「播放」+ 亂跳模式(上一首 / 播放暫停 / 停止 / 下一首)，右邊是「顯示」(音量 / 循環 / 清單 / 全螢幕)
         cr = QHBoxLayout()
+        cr.setSpacing(8)
         for txt, fn, attr in (("◀◀", self.prev, ""), ("▶ / ❚❚", self.toggle, ""), ("⏹", self.stop_play, "stop_btn"), ("▶▶", self.next, "")):
             b = QPushButton(txt)
             b.setMinimumWidth(52 if attr else 70)
@@ -4114,16 +4125,19 @@ class Player(QWidget):
                 setattr(self, attr, b)
                 b.setToolTip("停止 (畫面和進度條歸零)")
             cr.addWidget(b)
-        self.cold_btn = QPushButton("📉 從冷門歌開始播")
-        self.cold_btn.setMinimumWidth(130)
-        self.cold_btn.setToolTip("從「不常聽的歌」開始，照次數由少到多依序播 (會順便把排序切到冷門榜、關閉亂跳)")
-        self.cold_btn.clicked.connect(self.play_cold)
-        cr.addWidget(self.cold_btn)
-        self.rand_btn = QPushButton("🎲 隨機播放")
-        self.rand_btn.setMinimumWidth(100)
-        self.rand_btn.setToolTip("立刻隨機挑一首播放，之後持續隨機播下去")
-        self.rand_btn.clicked.connect(self.random_play)
-        cr.addWidget(self.rand_btn)
+        cr.addSpacing(10)
+        self.shuffle_cb = CycleButton()                   # 一顆按鈕輪流切換: 照順序 → 平均亂跳 → 常聽優先 → 冷門優先 → 探索 (右鍵有選單)
+        self.shuffle_cb.setObjectName("shufbtn")
+        self.shuffle_cb.setCheckable(True)
+        self.shuffle_cb.setMinimumWidth(150)
+        self.shuffle_cb.setChecked(self.cfg["shuffle"])
+        self.shuffle_cb.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.shuffle_cb.customContextMenuRequested.connect(self._shuf_menu)
+        self.shuffle_cb.clicked.connect(self._shuf_cycle)
+        self.shuffle_cb.toggled.connect(self._shuffle_toggled)
+        cr.addWidget(self.shuffle_cb)
+        self._shuf_label()
+        cr.addStretch(1)
         self.rep_btn = QPushButton()
         self.rep_btn.setObjectName("repbtn")
         self.rep_btn.setMinimumWidth(96)
@@ -4136,15 +4150,6 @@ class Player(QWidget):
         self.vol_btn.setToolTip("音量 (點一下展開，滑鼠滾輪也可調)")
         self.vol_btn.clicked.connect(self._show_vol_popup)
         cr.addWidget(self.vol_btn)
-        self.shuffle_cb = QPushButton("🔀 亂跳")          # 可切換的按鈕 (用法同核取方塊: isChecked / setChecked)
-        self.shuffle_cb.setObjectName("shufbtn")
-        self.shuffle_cb.setCheckable(True)
-        self.shuffle_cb.setMinimumWidth(80)
-        self.shuffle_cb.setChecked(self.cfg["shuffle"])
-        self.shuffle_cb.setToolTip("亮起時：不照順序播，從你選的那首開始後，下一首會隨機亂跳 (常聽的歌較常被抽到)")
-        self.shuffle_cb.toggled.connect(lambda on: self.cfg.__setitem__("shuffle", on))
-        cr.addWidget(self.shuffle_cb)
-        cr.addStretch(1)
         self.list_btn = QPushButton("📋 清單")
         self.list_btn.setObjectName("shufbtn")
         self.list_btn.setCheckable(True)
@@ -4810,6 +4815,10 @@ class Player(QWidget):
             self.now_lbl.setText(f"無法播放: {os.path.basename(path)} ({e})")
             return
         self.cur, self.play_start, self.last_tick = (fid, path), 0.0, time.time()
+        h = self.__dict__.setdefault("_play_hist", [])            # 播放紀錄: 亂跳時「上一首」要回到剛剛聽的那首，不是清單裡的鄰居
+        if not h or h[-1] != fid:
+            h.append(fid)
+            del h[:-300]
         self.counted = self.paused = False
         self.pos = 0.0
         self.length = 0.0 if self.mode == "video" else track_length(path)      # 影片長度等播放器讀到再填
@@ -5387,12 +5396,109 @@ class Player(QWidget):
         if not self.view:
             return
         if self.shuffle_cb.isChecked():
-            cur = self._cur_index()
-            pool = [i for i in range(len(self.view)) if i != cur] or [0]   # 盡量不連續抽到同一首
-            w = [1 + self.stats.info(self.view[i][0])[0] for i in pool]
-            self.play_index(random.choices(pool, weights=w)[0])
+            self.play_index(self._shuffle_pick())
         else:
             self.play_index((self._cur_index() + 1) % len(self.view))
+
+    # 亂跳的狀態: off=照順序 (按鈕不亮)；其餘 = 亮起，各種抽法
+    SHUF_NAMES = {"off": "➡ 照順序", "even": "🔀 平均亂跳", "hot": "🔥 常聽優先", "cold": "🧊 冷門優先", "explore": "🧭 探索"}
+    SHUF_TIPS = {"off": "照清單順序播", "even": "每首機率一樣，整份清單播過一輪才重來",
+                 "hot": "常聽的歌比較容易被抽到", "cold": "不常聽的歌比較容易被抽到",
+                 "explore": "平常偏常聽，但每隔幾首就穿插一首冷門 / 沒聽過的歌"}
+
+    def _shuf_state(self):
+        """目前的亂跳狀態。影片模式只有 照順序 / 平均亂跳"""
+        if not self.cfg["shuffle"]:
+            return "off"
+        return "even" if self.mode == "video" else self.cfg["shuffle_mode"]
+
+    def _shuf_states(self):
+        return ["off", "even"] if self.mode == "video" else ["off", "even", "hot", "cold", "explore"]
+
+    def _shuf_label(self):
+        st = self._shuf_state()
+        self.shuffle_cb.setText(self.SHUF_NAMES[st])
+        self.shuffle_cb.setToolTip(
+            "目前狀態：" + self.SHUF_NAMES[st] + "\n" + self.SHUF_TIPS[st] + "\n按一下換下一種" + ("" if self.mode == "video" else "，按右鍵可以直接選 / 從冷門歌開始播") +
+            "\n亮起 = 亂跳：先點選一首歌再按，就從那首開始；什麼都沒選就直接隨機挑一首")
+
+    def _shuf_set(self, st):
+        """切到某個狀態 (按鈕、右鍵選單共用)"""
+        on = st != "off"
+        if on:
+            self.cfg["shuffle_mode"] = st
+        self._shuf_bag, self._shuf_recent = [], []
+        save_cfg(self.cfg)
+        if self.shuffle_cb.isChecked() != on:
+            self.shuffle_cb.setChecked(on)              # 會觸發 _shuffle_toggled (沒在播時順便開始播)
+        self._shuf_label()
+
+    def _shuf_cycle(self):
+        sts = self._shuf_states()
+        cur = self._shuf_state()
+        self._shuf_set(sts[(sts.index(cur) + 1) % len(sts)] if cur in sts else sts[1])
+
+    def _shuf_menu(self, pos):
+        m = QMenu(self)
+        cur = self._shuf_state()
+        for st in self._shuf_states():
+            m.addAction(("✔ " if st == cur else "\u3000") + self.SHUF_NAMES[st] + "　" + self.SHUF_TIPS[st], lambda k=st: self._shuf_set(k))
+        if self.mode != "video":
+            m.addSeparator()
+            m.addAction("📉 從最冷門的歌開始依序播", self.play_cold)
+        m.exec(self.shuffle_cb.mapToGlobal(pos))
+
+    def _shuffle_pick(self):
+        """亂跳挑下一首 (回傳在 self.view 裡的位置)。
+        even = 洗牌袋: 每首機率一樣，整份清單每首都播過一輪才重來。
+        hot / cold = 加權抽籤 (常聽 / 不常聽的比較容易中)，但最近播過的幾首先排除，才不會一直回到同一首。"""
+        cur = self._cur_index()
+        ids = [fid for fid, _ in self.view]
+        cur_id = self.view[cur][0] if cur >= 0 else None
+        mode = "even" if self.mode == "video" else self.cfg["shuffle_mode"]     # 影片模式一律平均抽
+        if mode == "even" or len(ids) < 3:
+            have = set(ids)
+            bag = [f for f in getattr(self, "_shuf_bag", []) if f in have]     # 清單變了就把不在清單裡的拿掉
+            if not bag:
+                bag = [f for f in ids if f != cur_id] or ids[:]
+                random.shuffle(bag)
+            self._shuf_bag = bag
+            fid = bag.pop()
+        else:
+            recent = getattr(self, "_shuf_recent", [])
+            keep = min(len(ids) // 4, 30)                                       # 最近播過的這幾首先不抽
+            block = set(recent[-keep:] if keep else []) | {cur_id}
+            pool = [f for f in ids if f not in block] or [f for f in ids if f != cur_id] or ids
+            plays = {f: self.stats.info(f)[0] for f in pool}
+            if mode == "explore":                                               # 探索: 大約 3 首裡有 1 首走冷門路線，其餘偏常聽
+                mode = "cold" if random.random() < 0.34 else "hot"
+            if mode == "hot":
+                w = [1 + plays[f] for f in pool]
+            else:
+                w = [1.0 / (1 + plays[f]) for f in pool]
+            fid = random.choices(pool, weights=w)[0]
+            self._shuf_recent = (recent + [fid])[-60:]
+        for i, (f, _) in enumerate(self.view):
+            if f == fid:
+                return i
+        return 0
+
+    def _shuffle_toggled(self, on):
+        """亂跳按亮 = 隨機播放。正在播就繼續播、下一首起隨機；還沒播的話: 有選歌就從那首開始，沒選就隨機挑一首"""
+        self.cfg["shuffle"] = on
+        self._shuf_bag, self._shuf_recent = [], []
+        self._shuf_label()
+        if not on or self.cur or not self.view:
+            return
+        if self.mode == "video":
+            it = self.vtree.currentItem()
+            picked = it is not None and it.data(0, Qt.UserRole + 2) == "file"
+        else:
+            picked = self.tree.currentItem() is not None
+        if picked:
+            self.toggle()                 # 從選到的那首開始
+        else:
+            self.next()                   # 沒選歌: 直接隨機挑一首
 
     def play_cold(self):
         """從不常聽的歌開始播: 切到冷門榜、關掉亂跳，從最冷門的第一首依序播下去"""
@@ -5416,8 +5522,19 @@ class Player(QWidget):
         self.next()
 
     def prev(self):
-        if self.view:
-            self.play_index((self._cur_index() - 1) % len(self.view))
+        if not self.view:
+            return
+        if self.shuffle_cb.isChecked():
+            h = getattr(self, "_play_hist", [])
+            if h and self.cur and h[-1] == self.cur[0]:
+                h.pop()                                           # 目前這首
+            while h:
+                fid = h.pop()                                     # 往回找最近一首還在清單裡的 (play_index 會再把它記回去)
+                for i, (f, _) in enumerate(self.view):
+                    if f == fid:
+                        self.play_index(i)
+                        return
+        self.play_index((self._cur_index() - 1) % len(self.view))
 
     def toggle(self):
         if not self.cur:
@@ -5806,7 +5923,7 @@ class Player(QWidget):
         self.video_box.setVisible(vid)
         self.sort_cb.setVisible(not vid)
         self.sort_lbl.setVisible(not vid)
-        self.cold_btn.setVisible(not vid)
+        self._shuf_label()                           # 影片模式: 只有 照順序 / 平均亂跳
         self.stop_btn.setVisible(vid)
         self.list_btn.setVisible(vid)
         self.fs_btn.setVisible(vid and VIDEO_OK)
