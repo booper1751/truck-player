@@ -27,10 +27,10 @@ def _setup_ssl():
 
 _setup_ssl()
 
-VERSION = 31 # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 38     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
-UPDATE_CHECK_MIN = 31      # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
+UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
 
 FROZEN = bool(getattr(sys, "frozen", False))      # True = 打包成 EXE 後執行
 APP_NAME = "卡車播放器"
@@ -161,6 +161,9 @@ V_SORTS = [("name", "名稱 (預設)"), ("size_desc", "檔案大小：大 → �
            ("ctime_desc", "建立日期：新 → 舊"), ("ctime_asc", "建立日期：舊 → 新")]     # 影片清單的排序方式
 
 
+MARK_KEEP_DAYS = 30       # 「記住位置」最多保留幾天 (從最後一次更新算起)
+
+
 def human_size(n):
     n = float(n)
     for u in ("B", "KB", "MB", "GB"):
@@ -208,6 +211,14 @@ def setup_logging():
 
 
 setup_logging()
+try:                                                   # 版本資訊寫進記錄檔: 別人回報「影片比較暗 / 卡」時，一眼看出他用哪一版 Qt
+    import platform
+    import PySide6
+    from PySide6.QtCore import qVersion
+    LOG.info("版本: PySide6 %s｜Qt %s｜%s｜QT_MEDIA_BACKEND=%s", PySide6.__version__, qVersion(), platform.platform(),
+             os.environ.get("QT_MEDIA_BACKEND", "(預設)"))
+except Exception as _e:
+    LOG.info("版本資訊讀取失敗: %s", _e)
 
 
 class _Lap:
@@ -477,6 +488,8 @@ def load_cfg():
     c.setdefault("dl_playlist", True)
     c.setdefault("dl_aria2", True)
     c.setdefault("shuffle", False)         # 亂跳(隨機)模式是否開啟
+    c.setdefault("video_marks", {})        # 「記住位置」的影片: {影片編號: {"pos": 秒, "ts": 最後更新時間, "name": 檔名}}，超過 30 天沒動就自動清掉
+    c.setdefault("preload_audio", True)    # 播放前先把整首歌讀進記憶體 (≤100MB)，避免硬碟忙的時候音樂頓；想關掉就改成 false
     c.setdefault("shuffle_mode", "even")   # 亂跳怎麼抽: even=每首一樣 / hot=常聽的較常抽到 / cold=不常聽的較常抽到
     c.setdefault("update_src", "")         # 更新來源: GitHub 檔案網址 或 帳號/倉庫
     c.setdefault("update_auto", True)      # 啟動時自動檢查更新
@@ -522,6 +535,10 @@ def load_cfg():
     c.setdefault("video_sort", "name")     # 影片模式: 清單排序 name=名稱 / size_desc=大→小 / size_asc=小→大
     if c["mode"] not in ("music", "video"):
         c["mode"] = "music"
+    if not isinstance(c["video_marks"], dict):
+        c["video_marks"] = {}
+    _cut = time.time() - MARK_KEEP_DAYS * 86400
+    c["video_marks"] = {k: v for k, v in c["video_marks"].items() if isinstance(v, dict) and v.get("ts", 0) >= _cut}
     if c["shuffle_mode"] not in ("even", "hot", "cold", "explore"):
         c["shuffle_mode"] = "even"
     if c["video_sort"] not in [k for k, _ in V_SORTS]:
@@ -1193,6 +1210,8 @@ class SeekSlider(QSlider):
 
 def fmt(s):
     s = int(max(0, s))
+    if s >= 3600:                                      # 滿一小時: 1:05:09 (時:分:秒)；不到一小時維持 5:09
+        return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
     return f"{s // 60}:{s % 60:02d}"
 
 
@@ -1798,7 +1817,7 @@ class AltPicker(QDialog):
         self.lst = QListWidget()
         for i, c in enumerate(cands):
             d = int(c["dur"] or 0)
-            self.lst.addItem(f"{i + 1}. {c['title']}  [{d // 60}:{d % 60:02d}]")
+            self.lst.addItem(f"{i + 1}. {c['title']}  [{fmt(d)}]")
         v.addWidget(self.lst, 1)
         row = QHBoxLayout()
         row.addStretch(1)
@@ -3626,13 +3645,13 @@ class FsBar(QFrame):
         v.setSpacing(4)
         sr = QHBoxLayout()
         self.cur_lbl = QLabel("0:00")
-        self.cur_lbl.setFixedWidth(56)
+        self.cur_lbl.setFixedWidth(70)
         self.cur_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         sr.addWidget(self.cur_lbl)
         self.seek = SeekSlider()
         sr.addWidget(self.seek, 1)
         self.tot_lbl = QLabel("0:00")
-        self.tot_lbl.setFixedWidth(56)
+        self.tot_lbl.setFixedWidth(70)
         sr.addWidget(self.tot_lbl)
         v.addLayout(sr)
         cr = QHBoxLayout()
@@ -3722,7 +3741,7 @@ class Player(QWidget):
             QMessageBox.critical(self, "缺少 pygame", "自動安裝失敗。\n" + (LAST_ERR or ""))
             sys.exit(1)
         try:
-            pygame.mixer.pre_init(44100, -16, 2, 4096)      # 緩衝加大，避免電腦忙的時候音樂卡頓
+            pygame.mixer.pre_init(44100, -16, 2, 8192)      # 緩衝加大 (約 0.19 秒)，避免電腦忙的時候音樂卡頓；再大按暫停 / 調音量的延遲會變明顯
         except Exception:
             pass
         pygame.mixer.init()
@@ -3740,6 +3759,7 @@ class Player(QWidget):
             self.vplayer.errorOccurred.connect(self._v_error)
 
         self._build()
+        QApplication.instance().installEventFilter(self)        # 影片快捷鍵: 不管游標 / 焦點在清單、按鈕還是畫面，都收得到 (見 _global_video_key)
         if self.vplayer:
             self.vplayer.setVideoOutput(self.video_view)
         self.set_mode(self.mode, first=True)
@@ -4096,7 +4116,7 @@ class Player(QWidget):
         bv = QVBoxLayout(bottom)
         sr = QHBoxLayout()
         self.cur_lbl = QLabel("0:00")
-        self.cur_lbl.setFixedWidth(48)
+        self.cur_lbl.setFixedWidth(70)
         self.cur_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         sr.addWidget(self.cur_lbl)
         self.seek = SeekSlider()
@@ -4105,7 +4125,7 @@ class Player(QWidget):
         self.seek.seeked.connect(self._seek_done)
         sr.addWidget(self.seek, 1)
         self.tot_lbl = QLabel("0:00")
-        self.tot_lbl.setFixedWidth(48)
+        self.tot_lbl.setFixedWidth(70)
         sr.addWidget(self.tot_lbl)
         bv.addLayout(sr)
         self.now_lbl = MarqueeLabel("(未播放)")          # 歌名太長會像跑馬燈一樣捲動
@@ -4150,6 +4170,12 @@ class Player(QWidget):
         self.vol_btn.setToolTip("音量 (點一下展開，滑鼠滾輪也可調)")
         self.vol_btn.clicked.connect(self._show_vol_popup)
         cr.addWidget(self.vol_btn)
+        self.mark_btn = QPushButton("🔖 記住位置")
+        self.mark_btn.setObjectName("shufbtn")
+        self.mark_btn.setCheckable(True)
+        self.mark_btn.setMinimumWidth(110)
+        self.mark_btn.clicked.connect(self._mark_click)
+        cr.addWidget(self.mark_btn)
         self.list_btn = QPushButton("📋 清單")
         self.list_btn.setObjectName("shufbtn")
         self.list_btn.setCheckable(True)
@@ -4800,6 +4826,9 @@ class Player(QWidget):
         if not auto:
             self._finish_current(skipped=True)
         fid, path = self.view[idx]
+        if self.mode == "video":
+            self._save_mark("換影片")                      # 換影片之前，先記下上一部看到哪
+            self._v_resume, self._v_resume_n, self._v_resume_t0 = None, 0, time.time()
         try:
             if self.mode == "video":
                 url = QUrl.fromLocalFile(path)
@@ -4807,14 +4836,18 @@ class Player(QWidget):
                     self.vplayer.setPosition(0)
                 else:
                     self.vplayer.setSource(url)
+                    mk = self.cfg["video_marks"].get(fid)
+                    if mk and mk.get("pos", 0) > 5:
+                        self._v_resume = mk["pos"]
                 self.vplayer.play()
             else:
-                pygame.mixer.music.load(path)
+                self._music_load(path)
                 pygame.mixer.music.play()
         except Exception as e:
             self.now_lbl.setText(f"無法播放: {os.path.basename(path)} ({e})")
             return
         self.cur, self.play_start, self.last_tick = (fid, path), 0.0, time.time()
+        self._mark_ui()
         h = self.__dict__.setdefault("_play_hist", [])            # 播放紀錄: 亂跳時「上一首」要回到剛剛聽的那首，不是清單裡的鄰居
         if not h or h[-1] != fid:
             h.append(fid)
@@ -4840,6 +4873,22 @@ class Player(QWidget):
             if it:
                 self.tree.setCurrentItem(it)
                 self.tree.scrollToItem(it)
+
+    def _music_load(self, path):
+        """載入歌曲。預設先把整首讀進記憶體再播 (≤100MB)，播放中就不用再讀硬碟，
+        遊戲讀地圖、下載、掃描搶硬碟的時候，音樂才不會頓。讀不進來就退回原本的邊讀邊播。"""
+        if self.cfg.get("preload_audio", True):
+            try:
+                if os.path.getsize(path) <= 100 * 1024 * 1024:
+                    with open(path, "rb") as f:
+                        buf = io.BytesIO(f.read())
+                    pygame.mixer.music.load(buf, os.path.splitext(path)[1].lstrip("."))
+                    self._music_buf = buf                    # 要一直拿著，不然會被回收掉
+                    return
+            except Exception as e:
+                LOG.warning("整首讀進記憶體失敗，改用邊讀邊播: %s (%s)", os.path.basename(path), e)
+        self._music_buf = None
+        pygame.mixer.music.load(path)
 
     def _finish_current(self, skipped):
         if self.cur and self.mode != "video" and not self.counted and skipped and self.play_start < SKIP_BEFORE_S:
@@ -5107,7 +5156,7 @@ class Player(QWidget):
             if left <= 0:
                 self._timed_stop("時間到")
             else:
-                txt = f"剩餘 {left // 60}:{left % 60:02d}"
+                txt = f"剩餘 {fmt(left)}"
                 (self.st_min if self.btn_min.text() == "取消" else self.st_at).setText(txt)
         if self.stop_after_songs:
             self.st_cnt.setText(f"還會播完 {self.stop_after_songs} 首")
@@ -5555,6 +5604,7 @@ class Player(QWidget):
         else:
             if self.mode == "video":
                 self.vplayer.pause()
+                self._save_mark("暫停")
             else:
                 pygame.mixer.music.pause()
         self.paused = not self.paused
@@ -5926,6 +5976,8 @@ class Player(QWidget):
         self._shuf_label()                           # 影片模式: 只有 照順序 / 平均亂跳
         self.stop_btn.setVisible(vid)
         self.list_btn.setVisible(vid)
+        self.mark_btn.setVisible(vid)
+        self._mark_ui()
         self.fs_btn.setVisible(vid and VIDEO_OK)
         self.tool_r2w.setVisible(not vid)            # 影片模式: 收起背景 / 桌布那一排，畫面更大
         lap.mark("切換元件")
@@ -6172,6 +6224,7 @@ class Player(QWidget):
         self._stop_all()
         self.cur, self.paused, self.pos, self.length = None, False, 0.0, 0.0
         self.now_lbl.setText("(未播放)")
+        self._mark_ui()
 
     def _toggle_fullscreen(self):
         if VIDEO_OK and self.mode == "video":
@@ -6345,8 +6398,33 @@ class Player(QWidget):
                 ch.setAcceptDrops(True)
                 ch.installEventFilter(self)
 
+    _VK_LETTERS = (Qt.Key_F, Qt.Key_M, Qt.Key_L, Qt.Key_J, Qt.Key_K, Qt.Key_T)
+
+    def _global_video_key(self, e):
+        """影片模式的快捷鍵。以前要「影片畫面有焦點」才有用，一點到清單或按鈕就按 F 沒反應 (清單還會當成找檔名)。
+        現在整個視窗都有效；打字的輸入框完全不攔；清單 / 拉桿有焦點時只攔字母和數字鍵，方向鍵留給它們自己用。"""
+        try:
+            if QApplication.activeWindow() not in (self, self.video_view):
+                return False
+            if e.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+                return False
+            fw = QApplication.focusWidget()
+            if fw is not None:
+                if any(fw.inherits(n) for n in ("QLineEdit", "QTextEdit", "QPlainTextEdit", "QAbstractSpinBox", "QComboBox")):
+                    return False
+                if fw.inherits("QAbstractItemView") or fw.inherits("QAbstractSlider"):
+                    k = int(e.key())
+                    if not (k in [int(x) for x in self._VK_LETTERS] or int(Qt.Key_0) <= k <= int(Qt.Key_9)):
+                        return False
+            return bool(self._video_key(e))
+        except Exception as ex:
+            LOG.warning("影片快捷鍵處理失敗: %s", ex)
+            return False
+
     def eventFilter(self, obj, ev):
         t = ev.type()
+        if t == QEvent.KeyPress and VIDEO_OK and self.mode == "video" and self._global_video_key(ev):
+            return True
         if t in (QEvent.DragEnter, QEvent.DragMove, QEvent.Drop) and obj.property("_drophook"):
             md = ev.mimeData()
             if md is not None and md.hasUrls():
@@ -6384,7 +6462,95 @@ class Player(QWidget):
         else:
             self.open_external(paths)
 
+    # ---------------- 影片「記住位置」: 只有按了 🔖 的影片才會記，下次播就接著看 ----------------
+    def _mark_ui(self):
+        marks = self.cfg["video_marks"]
+        on = bool(self.cur) and self.mode == "video" and self.cur[0] in marks
+        self.mark_btn.blockSignals(True)
+        self.mark_btn.setChecked(on)
+        self.mark_btn.blockSignals(False)
+        if on:
+            m = marks[self.cur[0]]
+            self.mark_btn.setToolTip(f"這部影片已記住位置 ({fmt(m.get('pos', 0))})。暫停、停止、關閉程式、切到音樂、換影片時會自動更新，"
+                                     f"下次播放自動接著看。再按一次 = 取消記住。\n超過 {MARK_KEEP_DAYS} 天沒看會自動清掉")
+        else:
+            self.mark_btn.setToolTip("按一下: 記住這部影片現在看到的位置。之後暫停、關閉、切到音樂都會自動更新，下次播放自動接著看。\n"
+                                     "沒按的影片不會記。")
+
+    def _mark_click(self):
+        marks = self.cfg["video_marks"]
+        if not (self.cur and self.mode == "video"):
+            self.mark_btn.setChecked(False)
+            self.now_lbl.setText("先播一部影片，再按「記住位置」")
+            return
+        fid = self.cur[0]
+        if fid in marks:
+            del marks[fid]
+            save_cfg(self.cfg)
+            LOG.info("取消記住位置: %s", os.path.basename(self.cur[1]))
+        else:
+            marks[fid] = {"pos": 0, "ts": time.time(), "name": os.path.basename(self.cur[1])}
+            self._save_mark("按下標記")
+            LOG.info("記住位置: %s", os.path.basename(self.cur[1]))
+        self._mark_ui()
+
+    def _save_mark(self, why=""):
+        """把目前影片的位置存起來 (只對有按 🔖 的影片)。看到快結尾就當作看完，下次從頭"""
+        try:
+            if self.mode != "video" or not self.cur or not self.vplayer:
+                return
+            m = self.cfg["video_marks"].get(self.cur[0])
+            if m is None:
+                return
+            pos = self.vplayer.position() / 1000
+            dur = self.vplayer.duration() / 1000
+            if dur and pos >= dur - 10:                   # 快看完了 = 看完: 下次從頭
+                m["pos"], m["ts"] = 0, time.time()
+            elif pos > 0:
+                m["pos"], m["ts"] = int(pos), time.time()
+            else:
+                if why:
+                    LOG.info("記住位置(%s): 位置讀到 0，不更新 (%s)", why, m.get("name", ""))
+                return                                    # 位置讀到 0 (剛換片 / 剛停止): 不要蓋掉之前記的
+            save_cfg(self.cfg)
+            if why:
+                LOG.info("記住位置(%s): %s → %s", why, m.get("name", ""), fmt(m["pos"]))
+        except Exception as e:
+            LOG.warning("記住位置失敗: %s", e)
+
+    def _apply_resume(self):
+        """影片載入後，跳到上次記住的位置。載入前播放器可能還不能跳 (isSeekable 為假)，
+        所以不是跳一次就算數: _tick 會一直確認，沒跳到就再跳，最多等 15 秒"""
+        sec = getattr(self, "_v_resume", None)
+        if not sec:
+            return
+        try:
+            if not self.vplayer.isSeekable():
+                return
+            self._v_resume_n = getattr(self, "_v_resume_n", 0) + 1
+            self.vplayer.setPosition(int(sec * 1000))
+            LOG.info("接續位置: 第 %d 次跳到 %s", self._v_resume_n, fmt(sec))
+            if self._v_resume_n == 1:
+                self.now_lbl.setText(self.now_lbl.text() + f"　(已接續上次位置 {fmt(sec)})")
+        except Exception as e:
+            LOG.warning("接續位置失敗: %s", e)
+
+    def _resume_check(self):
+        """_tick 呼叫: 確認真的跳到了就收工；還沒跳到就再試"""
+        sec = getattr(self, "_v_resume", None)
+        if not sec:
+            return
+        if abs(self.pos - sec) < 5:
+            self._v_resume = None
+            LOG.info("接續位置: 已確認在 %s", fmt(self.pos))
+        elif getattr(self, "_v_resume_n", 0) >= 10 or time.time() - getattr(self, "_v_resume_t0", 0) > 15:
+            LOG.warning("接續位置: 放棄 (試了 %d 次，目前在 %s，目標 %s)", getattr(self, "_v_resume_n", 0), fmt(self.pos), fmt(sec))
+            self._v_resume = None
+        else:
+            self._apply_resume()
+
     def _stop_all(self):
+        self._save_mark("停止/切換")
         try:
             pygame.mixer.music.stop()
         except Exception:
@@ -6407,8 +6573,11 @@ class Player(QWidget):
         if self.mode == "video" and ms > 0:
             self.length = ms / 1000
             self.tot_lbl.setText(fmt(self.length))
+            self._apply_resume()
 
     def _v_status(self, st):
+        if st in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
+            self._apply_resume()
         if self.mode == "video" and self.cur and st == QMediaPlayer.MediaStatus.EndOfMedia:
             QTimer.singleShot(0, self._auto_next)
 
@@ -6485,6 +6654,11 @@ class Player(QWidget):
                 self.stats.add_play(self.cur[0])
             if self.mode == "video":
                 self.pos = self.vplayer.position() / 1000      # 影片的進度直接問播放器 (播完由 _v_status 通知)
+                if getattr(self, "_v_resume", None):
+                    self._resume_check()
+                elif now - getattr(self, "_mark_t", 0) > 15:
+                    self._mark_t = now
+                    self._save_mark()                   # (接續位置還沒完成時不存，免得把舊位置蓋成 0)
             elif not pygame.mixer.music.get_busy():
                 self._auto_next()
         self.last_tick = now
@@ -6611,6 +6785,7 @@ class Player(QWidget):
             self._to_tray()
             return
         self._quitting = True
+        self._save_mark("關閉程式")
         save_cfg(self.cfg)
         try:
             if self.tray:
