@@ -27,10 +27,10 @@ def _setup_ssl():
 
 _setup_ssl()
 
-VERSION = 38     # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 39# 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
-UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
+UPDATE_CHECK_MIN = 30     # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
 
 FROZEN = bool(getattr(sys, "frozen", False))      # True = 打包成 EXE 後執行
 APP_NAME = "卡車播放器"
@@ -133,6 +133,13 @@ try:
     import pygame
 except ImportError:
     pygame = None
+try:                                    # 影片解碼後端: 要在載入 QtMultimedia 之前就決定，所以直接先讀設定檔 (影片清單旁的「🎞 解碼」按鈕可以切換)
+    with open(os.path.join(os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__)), "player_config.json"), encoding="utf-8") as _f:
+        _vb = json.load(_f).get("v_backend", "")
+    if _vb in ("ffmpeg", "windows") and not os.environ.get("QT_MEDIA_BACKEND"):
+        os.environ["QT_MEDIA_BACKEND"] = _vb
+except Exception:
+    pass
 try:                                    # 影片播放: Qt 的 QtMultimedia (在 PySide6-Addons 裡，ensure_deps 會自動安裝)
     from PySide6.QtCore import QUrl
     from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -532,6 +539,7 @@ def load_cfg():
     c["lock"].setdefault("orig", {})
     c.setdefault("video_list_on", True)    # 影片模式: 右邊的播放清單是否顯示
     c.setdefault("video_open", None)       # 影片模式: 展開中的資料夾 (None = 第一次，頂層資料夾預設展開)
+    c.setdefault("v_backend", "")           # 影片解碼後端: "" = Qt 預設 / ffmpeg / windows (Windows 內建)，改了要重開程式
     c.setdefault("video_sort", "name")     # 影片模式: 清單排序 name=名稱 / size_desc=大→小 / size_asc=小→大
     if c["mode"] not in ("music", "video"):
         c["mode"] = "music"
@@ -2229,7 +2237,7 @@ class DownloadDialog(QDialog):
             if o["kind"] == "video":                # 影片: 下載最好的影像 + 聲音，用 ffmpeg 合併成 mp4 (不轉成 mp3)
                 h = {"1080p": 1080, "720p": 720, "480p": 480}.get(o["vq"])
                 opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b" if h else "bv*+ba/b"
-                opts["format_sort"] = ["res", "ext:mp4:m4a"]       # 同畫質時優先挑 mp4 / m4a，各種播放器都能放
+                opts["format_sort"] = ["res", "vcodec:h264", "ext:mp4:m4a"]       # 同畫質時優先挑 H.264 (幾乎所有電腦都有硬體解碼，拖進度條才快；VP9 / AV1 要靠 CPU 硬解)，再優先 mp4 / m4a
                 opts["merge_output_format"] = "mp4"
                 opts.pop("postprocessors", None)
             aria = aria2c_path() if o["aria"] else ""
@@ -4047,6 +4055,10 @@ class Player(QWidget):
         self.v_sort_btn.setToolTip("影片清單的排序: 名稱 / 檔案大小 (大→小、小→大)")
         self.v_sort_btn.clicked.connect(self._v_sort_menu)
         vr.addWidget(self.v_sort_btn)
+        self.v_dec_btn = QPushButton("🎞 解碼")
+        self.v_dec_btn.setToolTip("影片解碼後端: 拖進度條畫面出來得很慢時，可以換一個試試 (改完要重開程式)")
+        self.v_dec_btn.clicked.connect(self._v_dec_menu)
+        vr.addWidget(self.v_dec_btn)
         self._v_sort_label()
         vb.addLayout(vr)
         self.v_count_lbl = QLabel("")
@@ -4832,6 +4844,7 @@ class Player(QWidget):
         try:
             if self.mode == "video":
                 url = QUrl.fromLocalFile(path)
+                self._v_seek = None
                 if self.vplayer.source() == url:          # 同一部再播一次 (單曲循環): 回到開頭
                     self.vplayer.setPosition(0)
                 else:
@@ -5648,6 +5661,27 @@ class Player(QWidget):
         for key, label in V_SORTS:
             m.addAction(("✔ " if self.cfg["video_sort"] == key else "\u3000") + label, lambda k=key: self._v_set_sort(k))
         m.exec(self.v_sort_btn.mapToGlobal(QPoint(0, self.v_sort_btn.height())))
+
+    def _v_dec_menu(self):
+        cur = self.cfg.get("v_backend", "")
+        now = os.environ.get("QT_MEDIA_BACKEND") or "Qt 預設"
+        m = QMenu(self)
+        a = m.addAction("目前使用: " + now)
+        a.setEnabled(False)
+        m.addSeparator()
+        for key, label in (("", "Qt 預設"), ("ffmpeg", "FFmpeg"), ("windows", "Windows 內建 (Media Foundation)")):
+            m.addAction(("✔ " if cur == key else "\u3000") + label, lambda k=key: self._v_set_backend(k))
+        a = m.addAction("改完要重新開啟程式才會生效")
+        a.setEnabled(False)
+        m.exec(self.v_dec_btn.mapToGlobal(QPoint(0, self.v_dec_btn.height())))
+
+    def _v_set_backend(self, key):
+        if key == self.cfg.get("v_backend", ""):
+            return
+        self.cfg["v_backend"] = key
+        save_cfg(self.cfg)
+        QMessageBox.information(self, "影片解碼", "已改成「%s」。\n請把程式完全關閉 (系統匣的圖示也要「結束」) 再重新開啟才會生效。\n\n"
+                                "怎麼比較哪個快: 拖進度條跳轉後，記錄檔裡會有一行「影片跳轉: 到 … 花了 … 秒」。" % (key or "Qt 預設"))
 
     def _v_set_sort(self, key):
         if key == self.cfg["video_sort"]:
@@ -6502,7 +6536,7 @@ class Player(QWidget):
             m = self.cfg["video_marks"].get(self.cur[0])
             if m is None:
                 return
-            pos = self.vplayer.position() / 1000
+            pos = self._v_pos_now()
             dur = self.vplayer.duration() / 1000
             if dur and pos >= dur - 10:                   # 快看完了 = 看完: 下次從頭
                 m["pos"], m["ts"] = 0, time.time()
@@ -6558,6 +6592,7 @@ class Player(QWidget):
         if self.vplayer:
             self._set_fullscreen(False)
             self.vplayer.stop()
+            self._v_seek = None
             self.vplayer.setSource(QUrl())
 
     def _set_play_vol(self, f):
@@ -6625,15 +6660,26 @@ class Player(QWidget):
     def _seek_rel(self, sec):
         """快轉 / 倒退 sec 秒 (影片模式的左右鍵)"""
         if self.cur and self.length:
-            self._seek_to(self.pos + sec)
+            sk = getattr(self, "_v_seek", None)
+            base = sk[0] if (self.mode == "video" and sk) else self.pos      # 還在跳轉時，接著「上一次要跳的位置」算，連按才會累加
+            self._seek_to(base + sec, delay=(self.mode == "video"))
 
-    def _seek_to(self, target):
+    def _seek_to(self, target, delay=False):
         if not self.cur or not self.length:
             return
         target = max(0.0, min(self.length - 0.5, target))
         try:
             if self.mode == "video":
-                self.vplayer.setPosition(int(target * 1000))
+                if delay:                          # 連按左右鍵: 等手停 0.25 秒才真的跳，不然每按一下就重新解碼一次，越按越慢
+                    self._v_seek = [target, time.time(), False]
+                    t = getattr(self, "_v_seek_timer", None)
+                    if t is None:
+                        t = self._v_seek_timer = QTimer(self)
+                        t.setSingleShot(True)
+                        t.timeout.connect(self._v_seek_fire)
+                    t.start(250)
+                else:
+                    self._v_seek_go(target)
             else:
                 pygame.mixer.music.play(start=target)
                 if self.paused:
@@ -6642,6 +6688,31 @@ class Player(QWidget):
             self.last_tick = time.time()
         except Exception as e:
             self.now_lbl.setText(f"這首歌無法跳轉: {e}")
+
+    def _v_seek_go(self, target):
+        """真的叫影片播放器跳。播放器解碼到目標位置之前，問它位置它還是會回舊的，
+        所以記下「正在跳到哪」，進度條和時間先停在那裡 (見 _v_pos_now)，不會被拉回去"""
+        self.vplayer.setPosition(int(target * 1000))
+        self._v_seek = [target, time.time(), True] if self.vplayer.isSeekable() else None
+
+    def _v_seek_fire(self):
+        sk = getattr(self, "_v_seek", None)
+        if sk and self.cur and self.mode == "video":
+            self._v_seek_go(sk[0])
+
+    def _v_pos_now(self):
+        """影片目前的位置 (秒)。剛跳轉完、播放器還在解碼時，它回報的還是舊位置，這段時間就先回傳「跳到的位置」；
+        等它真的到了目標附近 (或等超過 15 秒放棄) 才改回問播放器"""
+        p = self.vplayer.position() / 1000
+        sk = getattr(self, "_v_seek", None)
+        if not sk:
+            return p
+        target, t0, fired = sk
+        if fired and (abs(p - target) <= 2.5 or time.time() - t0 > 15):
+            LOG.info("影片跳轉: 到 %s 花了 %.1f 秒%s", fmt(target), time.time() - t0, "" if abs(p - target) <= 2.5 else " (逾時，沒等到)")
+            self._v_seek = None
+            return p
+        return target
 
     def _tick(self):
         now = time.time()
@@ -6653,7 +6724,7 @@ class Player(QWidget):
                 self.counted = True
                 self.stats.add_play(self.cur[0])
             if self.mode == "video":
-                self.pos = self.vplayer.position() / 1000      # 影片的進度直接問播放器 (播完由 _v_status 通知)
+                self.pos = self._v_pos_now()                   # 影片的進度問播放器 (跳轉中先停在目標位置；播完由 _v_status 通知)
                 if getattr(self, "_v_resume", None):
                     self._resume_check()
                 elif now - getattr(self, "_mark_t", 0) > 15:
@@ -6661,12 +6732,16 @@ class Player(QWidget):
                     self._save_mark()                   # (接續位置還沒完成時不存，免得把舊位置蓋成 0)
             elif not pygame.mixer.music.get_busy():
                 self._auto_next()
+        elif self.cur and self.paused and self.mode == "video" and getattr(self, "_v_seek", None):
+            p = self._v_pos_now()                      # 暫停中跳轉: 也要等它到了才解除「跳轉中」
+            if not getattr(self, "_v_seek", None):
+                self.pos = p
         self.last_tick = now
         self._clock_tick()
         if not self.seek.dragging:
             self.seek.blockSignals(True)
             if self.cur:
-                self.cur_lbl.setText(fmt(self.pos))
+                self.cur_lbl.setText(("⏳ " if (self.mode == "video" and getattr(self, "_v_seek", None)) else "") + fmt(self.pos))     # ⏳ = 正在解碼跳轉
                 self.seek.setValue(int(min(1.0, self.pos / self.length) * 1000) if self.length else 0)
             else:                                   # 停止播放/清單播完: 進度條歸零
                 self.cur_lbl.setText("0:00")
