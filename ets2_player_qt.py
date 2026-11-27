@@ -27,10 +27,10 @@ def _setup_ssl():
 
 _setup_ssl()
 
-VERSION = 39# 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
+VERSION = 40    # 版本號 (整數)。每次發新版請把這個數字加 1，自動更新就是靠它判斷有沒有新版
 UPDATE_DEFAULT_FILE = "ets2_player_qt.py"     # 只填「帳號/倉庫」時，預設去倉庫抓的檔名
 UPDATE_SRC_DEFAULT = ""     # 這裡請維持空白！帳號與網址放在程式旁邊的 update_source.json (不要上傳到 GitHub、不要給別人)，程式碼裡就看不到你的帳號
-UPDATE_CHECK_MIN = 30     # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
+UPDATE_CHECK_MIN = 30       # 程式開著時，每隔幾分鐘再檢查一次有沒有新版
 
 FROZEN = bool(getattr(sys, "frozen", False))      # True = 打包成 EXE 後執行
 APP_NAME = "卡車播放器"
@@ -106,6 +106,9 @@ def ensure_deps():
     if importlib.util.find_spec("mutagen") is None:
         print("正在下載安裝 mutagen (讀取歌曲長度，進度條與隱藏清單比對要用) ...")
         _pip("mutagen")
+    if importlib.util.find_spec("qrcode") is None:
+        print("正在下載安裝 qrcode (分享到手機的 QR code 要用) ...")
+        _pip("qrcode")
     if importlib.util.find_spec("keyboard") is None:
         print("正在下載安裝 keyboard ...")
         _pip("keyboard")
@@ -3711,6 +3714,536 @@ class CycleButton(QPushButton):
         pass
 
 
+# ====================== 分享到手機 (電腦臨時開一個只有區域網路看得到的小網頁，手機掃 QR code 下載你勾選的歌) ======================
+import http.server, ipaddress, mimetypes, secrets, socket
+import html as _html
+from PySide6.QtWidgets import QListWidget, QListWidgetItem, QStackedWidget
+
+SHARE_IDLE_S = 600           # 這麼久沒有任何人連進來就自動關閉
+SHARE_MAX_BAD = 10           # 口令錯誤這麼多次就直接關閉 (有人在亂猜)
+
+
+def lan_ip():
+    """這台電腦在區域網路的 IP (不會真的送出封包)。抓不到就回 127.0.0.1"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+FW_RULE = "TruckPlayerShare"
+
+
+def fw_prog():
+    return os.path.abspath(sys.executable)           # EXE 版是 EXE 本身；直接跑 .py 時是 python.exe (規則是依「程式路徑」開放，不用管連接埠)
+
+
+def fw_rule_exists():
+    """Windows 防火牆有沒有這支程式的規則。回傳 True / False；非 Windows 或查不出來回傳 None (不要擋人)"""
+    if os.name != "nt":
+        return None
+    try:
+        r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", "name=" + FW_RULE, "verbose"],
+                           capture_output=True, creationflags=0x08000000, timeout=15)
+        if r.returncode != 0:
+            return False
+        prog = fw_prog().lower()
+        for enc in ("oem", "mbcs", "utf-8"):               # netsh 輸出用的是主控台的 OEM 代碼頁，不一定是 mbcs；每種都試試，路徑有出現就算有
+            try:
+                if prog in r.stdout.decode(enc, "replace").lower():
+                    return True
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return None
+
+
+def fw_rule_ok():
+    return fw_rule_exists() is not False
+
+
+def _fw_elevated(args, want_exists):
+    """用系統管理員權限 (會跳 Windows 權限視窗，按「是」才會執行) 跑 netsh，再等到規則的有無變成想要的狀態"""
+    try:
+        if ctypes.windll.shell32.ShellExecuteW(None, "runas", "netsh", args, None, 0) <= 32:      # 沒回傳成功 = 使用者在權限視窗按了「否」
+            return False
+        for _ in range(30):                                  # 提升權限的 netsh 是另一個程序，等它做完 (最多約 15 秒)
+            time.sleep(0.5)
+            if fw_rule_exists() is want_exists:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def fw_add_rule():
+    """加入防火牆規則: 只針對這支程式、TCP、私人 / 公用網路，而且只接受「同一個區域網路 (localsubnet)」的設備。回傳是否成功"""
+    if os.name != "nt":
+        return True
+    return _fw_elevated('advfirewall firewall add rule name="%s" dir=in action=allow program="%s" enable=yes profile=private,public protocol=TCP remoteip=localsubnet'
+                        % (FW_RULE, fw_prog()), True)
+
+
+def fw_remove_rule():
+    if os.name != "nt":
+        return True
+    return _fw_elevated('advfirewall firewall delete rule name="%s"' % FW_RULE, False)
+
+
+def qr_pixmap(text, box=7):
+    """文字 → QR code 的 QPixmap (用 qrcode 套件算出方格，自己畫，不需要 Pillow)"""
+    import qrcode
+    q = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    q.add_data(text)
+    q.make(fit=True)
+    m = q.get_matrix()
+    n = len(m)
+    img = QImage(n * box, n * box, QImage.Format_RGB32)
+    img.fill(QColor("white"))
+    p = QPainter(img)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor("black"))
+    for y, row in enumerate(m):
+        for x, on in enumerate(row):
+            if on:
+                p.drawRect(x * box, y * box, box, box)
+    p.end()
+    return QPixmap.fromImage(img)
+
+
+class _ShareHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"          # 每個請求用完就斷線，簡單
+    server_version = "Share"
+    sys_version = ""
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+        b = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        sv = self.server
+        try:
+            ip = ipaddress.ip_address(self.client_address[0])
+            if not (ip.is_private or ip.is_loopback or ip.is_link_local):      # 只讓區域網路內的設備連，外面來的一律拒絕
+                return self._send(403, "Forbidden")
+        except ValueError:
+            return self._send(403, "Forbidden")
+        u = urllib.parse.urlsplit(self.path)
+        if u.path == "/favicon.ico":
+            return self._send(404, "Not found")
+        k = urllib.parse.parse_qs(u.query).get("k", [""])[0]
+        if not secrets.compare_digest(k.encode("utf-8"), sv.token.encode("utf-8")):
+            sv.bad += 1
+            sv.cb("bad", sv.bad)
+            return self._send(403, "Forbidden")
+        sv.last = time.time()
+        if u.path == "/":
+            return self._index()
+        m = re.fullmatch(r"/d/(\d+)", u.path)
+        if m and int(m.group(1)) < len(sv.files):
+            return self._file(int(m.group(1)))
+        self._send(404, "Not found")
+
+    def _index(self):
+        sv = self.server
+        rows = []
+        for i, (name, path) in enumerate(sv.files):
+            try:
+                mb = os.path.getsize(path) / 1048576
+            except OSError:
+                mb = 0
+            if sv.done[i]:
+                rows.append('<li class="ok">✔ %s <small>(已傳完)</small></li>' % _html.escape(name))
+            else:
+                rows.append('<li><a class="dl" href="/d/%d?k=%s">%s</a> <small>%.1f MB</small></li>' % (i, sv.token, _html.escape(name), mb))
+        page = """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>傳歌到手機</title><style>
+body{font-family:system-ui,sans-serif;background:#16181f;color:#eee;margin:0;padding:16px;max-width:720px;margin:auto}
+h2{margin:6px 0 12px}ul{list-style:none;padding:0}li{padding:12px 4px;border-bottom:1px solid #2c3040;word-break:break-all}
+a{color:#9db7ff;text-decoration:none;font-size:17px}li.ok{color:#7ddc8a}small{color:#8a90a6}
+button{background:#6c63ff;color:#fff;border:0;border-radius:10px;padding:14px 18px;font-size:17px;width:100%%;margin:8px 0}
+p{color:#9aa0b5;font-size:14px}</style></head><body>
+<h2>📱 傳歌到手機</h2><button id="all">全部下載 (%d 首)</button>
+<p>點歌名可以一首一首下載。「全部下載」時，Chrome 可能會問要不要允許下載多個檔案，請按允許。每首歌只能下載一次。</p>
+<ul>%s</ul>
+<script>document.getElementById('all').onclick=function(){var a=document.querySelectorAll('a.dl'),i=0;
+function nx(){if(i>=a.length)return;var x=document.createElement('a');x.href=a[i].href;x.download='';document.body.appendChild(x);x.click();x.remove();i++;setTimeout(nx,1500);}nx();};</script>
+</body></html>""" % (sum(1 for d in sv.done if not d), "".join(rows))
+        self._send(200, page, "text/html; charset=utf-8")
+
+    def _file(self, i):
+        sv = self.server
+        name, path = sv.files[i]
+        with sv.lock:                                   # 一開始就占位: 同一首同時只讓一個連線下載，傳完 (done) 就永遠不能再下載
+            if sv.done[i] or sv.busy[i]:
+                return self._send(410, "這首已經傳完了，或正在傳")
+            sv.busy[i] = True
+        try:
+            size = os.path.getsize(path)
+            f = open(path, "rb")
+        except OSError:
+            sv.busy[i] = False
+            return self._send(404, "Not found")
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        ascii_name = re.sub(r'[^A-Za-z0-9._ -]', "_", name.encode("ascii", "ignore").decode()) or "song" + os.path.splitext(path)[1]
+        sent = 0
+        try:
+            with f:
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", "attachment; filename=\"%s\"; filename*=UTF-8''%s" % (ascii_name, urllib.parse.quote(name)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                while True:
+                    b = f.read(65536)
+                    if not b:
+                        break
+                    self.wfile.write(b)
+                    sent += len(b)
+                    sv.last = time.time()
+            self.wfile.flush()
+            conn = self.connection                  # 資料交給系統不代表手機收完了: 等手機正常關閉連線才算傳完。
+            conn.shutdown(socket.SHUT_WR)           # 手機中途斷掉 (連線被重設) 會丟出例外 → 算失敗；等 20 秒都沒動靜就當作成功
+            conn.settimeout(20)
+            try:
+                while conn.recv(4096):
+                    pass
+            except socket.timeout:
+                pass
+        except Exception:
+            sv.busy[i] = False
+            sv.cb("fail", i)               # 手機中途斷線: 不算傳完，釋放占位，可以再掃一次重傳
+            return
+        if sent == size:
+            sv.done[i] = True              # (busy 不放掉，傳完就鎖死)
+            sv.cb("done", i)
+        else:
+            sv.busy[i] = False
+
+
+class ShareServer:
+    """臨時的檔案分享服務: 只開放勾選的那幾首、要口令、每首只能下載一次"""
+
+    def __init__(self, files, cb):
+        self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _ShareHandler)
+        self.httpd.daemon_threads = True
+        self.httpd.files = files
+        self.httpd.done = [False] * len(files)
+        self.httpd.busy = [False] * len(files)
+        self.httpd.lock = threading.Lock()
+        self.httpd.token = secrets.token_urlsafe(16)
+        self.httpd.bad = 0
+        self.httpd.last = time.time()
+        self.httpd.cb = cb
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.3}, daemon=True).start()
+
+    @property
+    def token(self):
+        return self.httpd.token
+
+    def idle(self):
+        return time.time() - self.httpd.last
+
+    def stop(self):
+        def run():
+            try:
+                self.httpd.shutdown()
+                self.httpd.server_close()
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
+
+
+class ShareDialog(QDialog):
+    """分享到手機: 先勾選要傳的歌 → 開始傳送 → 手機掃 QR code → 一首一首下載 → 全部傳完自動關閉"""
+    sig_ev = Signal(str, int)
+
+    def __init__(self, player):
+        super().__init__(player)
+        self.pl = player
+        self.srv = None
+        self.sel = []                # [(顯示名稱, 路徑)]
+        self.setWindowTitle("📱 分享到手機")
+        self.resize(620, 680)
+        top = QVBoxLayout(self)
+        self.stack = QStackedWidget()
+        top.addWidget(self.stack)
+
+        # ---- 第 1 頁: 勾選 ----
+        pg = QWidget()
+        v = QVBoxLayout(pg)
+        v.addWidget(QLabel("勾選要傳到手機的歌 (只會傳你勾的):"))
+        self.q = QLineEdit()
+        self.q.setPlaceholderText("搜尋歌名…")
+        self.q.textChanged.connect(self._filter)
+        v.addWidget(self.q)
+        self.lst = QListWidget()
+        tracks = list(player.tracks)
+        order = {t[0]: i for i, t in enumerate(getattr(player, "view", []) or [])}          # 照目前清單的排序 (常聽榜等) 排
+        tracks.sort(key=lambda t: order.get(t[0], 10 ** 9))
+        for fid, path in tracks:
+            it = QListWidgetItem(os.path.splitext(os.path.basename(path))[0])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(Qt.Unchecked)
+            it.setData(Qt.UserRole, path)
+            self.lst.addItem(it)
+        self.lst.itemChanged.connect(self._recount)
+        v.addWidget(self.lst, 1)
+        r = QHBoxLayout()
+        b = QPushButton("全選 (目前顯示的)")
+        b.clicked.connect(lambda: self._set_all(True))
+        r.addWidget(b)
+        b = QPushButton("全不選")
+        b.clicked.connect(lambda: self._set_all(False))
+        r.addWidget(b)
+        if os.name == "nt":
+            b = QPushButton("🛡 防火牆")
+            b.setToolTip("手機連不進來時按這個: 加入 / 移除 Windows 防火牆「允許這個程式接受連入」的規則")
+            b.clicked.connect(self._fw_menu)
+            r.addWidget(b)
+        r.addStretch(1)
+        self.count_lbl = QLabel("已選 0 首")
+        r.addWidget(self.count_lbl)
+        v.addLayout(r)
+        if os.name == "nt":
+            self.fw_rm_cb = QCheckBox("分享結束後，自動移除防火牆規則 (結束時會再跳一次 Windows 權限視窗)")
+            self.fw_rm_cb.setChecked(bool(player.cfg.get("share_fw_remove", False)))
+            self.fw_rm_cb.toggled.connect(self._fw_rm_toggled)
+            v.addWidget(self.fw_rm_cb)
+        self.go_btn = QPushButton("📤 開始傳送")
+        self.go_btn.setMinimumHeight(38)
+        self.go_btn.setEnabled(False)
+        self.go_btn.clicked.connect(self._start)
+        v.addWidget(self.go_btn)
+        self.stack.addWidget(pg)
+
+        # ---- 第 2 頁: QR code ----
+        pg = QWidget()
+        v = QVBoxLayout(pg)
+        self.qr_lbl = QLabel()
+        self.qr_lbl.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.qr_lbl)
+        self.url_lbl = QLabel("")
+        self.url_lbl.setAlignment(Qt.AlignCenter)
+        self.url_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.url_lbl.setWordWrap(True)
+        v.addWidget(self.url_lbl)
+        self.stat_lbl = QLabel("")
+        self.stat_lbl.setStyleSheet("font-size:15px;font-weight:bold;")
+        self.stat_lbl.setAlignment(Qt.AlignCenter)
+        v.addWidget(self.stat_lbl)
+        self.done_lst = QListWidget()
+        v.addWidget(self.done_lst, 1)
+        hint = QLabel("手機要和電腦連同一個 Wi-Fi，用相機或 Chrome 掃上面的 QR code。每首歌只能下載一次，全部傳完會自動關閉，"
+                      "太久沒人連也會自動關閉。第一次使用時，如果 Windows 防火牆跳出提示，請按「允許」，否則手機連不進來。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#9aa0b5;")
+        v.addWidget(hint)
+        self.stop_btn = QPushButton("⏹ 停止分享")
+        self.stop_btn.setMinimumHeight(38)
+        self.stop_btn.clicked.connect(lambda: self._stop("你按了停止分享"))
+        v.addWidget(self.stop_btn)
+        self.again_btn = QPushButton("⬅ 重新選歌")
+        self.again_btn.setMinimumHeight(38)
+        self.again_btn.clicked.connect(self._back)
+        self.again_btn.hide()
+        v.addWidget(self.again_btn)
+        self.stack.addWidget(pg)
+
+        self.sig_ev.connect(self._on_ev)
+        self.tm = QTimer(self)
+        self.tm.setInterval(5000)
+        self.tm.timeout.connect(self._idle_check)
+
+    # ---------- 第 1 頁 ----------
+    def _filter(self, t):
+        t = t.strip().lower()
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            it.setHidden(bool(t) and t not in it.text().lower())
+
+    def _set_all(self, on):
+        self.lst.blockSignals(True)
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            if not it.isHidden():
+                it.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self.lst.blockSignals(False)
+        self._recount()
+
+    def _recount(self, *_):
+        n = sum(1 for i in range(self.lst.count()) if self.lst.item(i).checkState() == Qt.Checked)
+        self.count_lbl.setText("已選 %d 首" % n)
+        self.go_btn.setEnabled(n > 0)
+
+    def _fw_check(self, force=False):
+        """Windows 防火牆沒有規則，手機就連不進來。問使用者要不要加 (會跳 Windows 權限視窗)。回傳 False = 使用者取消這次傳送"""
+        if os.name != "nt" or fw_rule_ok():
+            return True
+        if not force and self.pl.cfg.get("share_fw_declined"):
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("分享到手機")
+        box.setText("要讓手機連得進來，Windows 防火牆需要加一條「允許這個程式接受連入連線」的規則。\n\n"
+                    "按「加入」後會跳出 Windows 的系統權限視窗，請按「是」。只會加這一條，之後不會再問；"
+                    "分享時還要有 QR code 裡的口令才進得來，只在你按「開始傳送」到結束之間才會開著。")
+        b_add = box.addButton("加入", QMessageBox.AcceptRole)
+        b_skip = box.addButton("不加入，直接傳送", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        c = box.clickedButton()
+        if c is b_add:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                ok = fw_add_rule()
+            finally:
+                QApplication.restoreOverrideCursor()
+            self.pl.cfg["share_fw_declined"] = False
+            save_cfg(self.pl.cfg)
+            if not ok:
+                QMessageBox.warning(self, "分享到手機", "沒有加成功 (可能在權限視窗按了「否」)。\n仍然可以傳送，但手機可能連不進來；"
+                                    "之後可以按選歌畫面的「🛡 防火牆」再試一次。")
+            return True
+        if c is b_skip:
+            self.pl.cfg["share_fw_declined"] = True              # 之後不再問 (想加可以按選歌畫面的「🛡 防火牆」)
+            save_cfg(self.pl.cfg)
+            return True
+        return False
+
+    def _fw_rm_toggled(self, on):
+        self.pl.cfg["share_fw_remove"] = bool(on)
+        save_cfg(self.pl.cfg)
+
+    def _fw_menu(self):
+        ex = fw_rule_exists()
+        m = QMenu(self)
+        a = m.addAction("目前: " + ("已加入防火牆規則" if ex else "還沒有防火牆規則"))
+        a.setEnabled(False)
+        m.addSeparator()
+        m.addAction("加入允許規則", self._fw_add_now).setEnabled(not ex)
+        m.addAction("移除允許規則", self._fw_remove_now).setEnabled(bool(ex))
+        m.exec(QCursor.pos())
+
+    def _fw_add_now(self):
+        self.pl.cfg["share_fw_declined"] = False
+        self._fw_check(True)
+
+    def _fw_remove_now(self):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok = fw_remove_rule()
+        finally:
+            QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "分享到手機", "已移除防火牆規則。" if ok else "沒有移除成功 (可能在權限視窗按了「否」)，規則還在。")
+
+    def _start(self):
+        self.sel = []
+        for i in range(self.lst.count()):
+            it = self.lst.item(i)
+            if it.checkState() == Qt.Checked:
+                p = it.data(Qt.UserRole)
+                if os.path.isfile(p):
+                    self.sel.append((os.path.basename(p), p))
+        if not self.sel or not self._fw_check():
+            return
+        try:
+            self.srv = ShareServer(self.sel, lambda kind, i: self.sig_ev.emit(kind, i))
+        except Exception as e:
+            QMessageBox.warning(self, "分享到手機", "沒辦法開啟分享: %s" % e)
+            return
+        ip = lan_ip()
+        url = "http://%s:%d/?k=%s" % (ip, self.srv.port, self.srv.token)
+        try:
+            self.qr_lbl.setPixmap(qr_pixmap(url, 7))
+        except Exception as e:
+            self.qr_lbl.setText("(QR code 產生不出來: %s)\n請在手機瀏覽器手動輸入下面的網址" % e)
+        self.url_lbl.setText(url if ip != "127.0.0.1" else "抓不到區域網路位址，請確認電腦有連上 Wi-Fi 或網路")
+        self.done_lst.clear()
+        for name, _ in self.sel:
+            self.done_lst.addItem("　" + name)
+        self._update_stat()
+        self.stop_btn.show()
+        self.again_btn.hide()
+        self.stack.setCurrentIndex(1)
+        self.tm.start()
+
+    # ---------- 第 2 頁 ----------
+    def _update_stat(self, extra=""):
+        n = sum(self.srv.httpd.done) if self.srv else getattr(self, "_last_n", 0)
+        self._last_n = n
+        self.stat_lbl.setText("已傳 %d / %d 首%s" % (n, len(self.sel), ("　" + extra) if extra else ""))
+
+    def _on_ev(self, kind, i):
+        if not self.srv:
+            return
+        if kind == "done":
+            self.done_lst.item(i).setText("✔ " + self.sel[i][0])
+            self._update_stat()
+            if all(self.srv.httpd.done):
+                QTimer.singleShot(1500, lambda: self._stop("全部傳完了，分享已自動關閉", True))
+        elif kind == "fail":
+            self._update_stat("(有一首中途斷線，可以重新掃 QR code 再傳)")
+        elif kind == "bad" and i >= SHARE_MAX_BAD:
+            self._stop("有人用錯誤的口令連太多次，為了安全已自動關閉")
+
+    def _idle_check(self):
+        if self.srv and self.srv.idle() > SHARE_IDLE_S:
+            self._stop("太久沒有人連進來，已自動關閉")
+
+    def _stop(self, why, ok=False):
+        if not self.srv:
+            return
+        self._update_stat()
+        self.srv.stop()
+        self.srv = None
+        self.tm.stop()
+        fw_note = self._fw_cleanup()
+        self.qr_lbl.clear()
+        self.qr_lbl.setText("✅ 分享已結束" if ok else "⛔ 分享已結束")
+        self.qr_lbl.setStyleSheet("font-size:22px;font-weight:bold;")
+        self.url_lbl.setText(why + "。QR code 已經失效。" + fw_note)
+        self.stop_btn.hide()
+        self.again_btn.show()
+
+    def _fw_cleanup(self):
+        """有勾「分享結束後自動移除防火牆規則」就把規則刪掉。回傳要顯示給使用者的一句話"""
+        if os.name != "nt" or not self.pl.cfg.get("share_fw_remove") or fw_rule_exists() is not True:
+            return ""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok = fw_remove_rule()
+        finally:
+            QApplication.restoreOverrideCursor()
+        return "　防火牆規則已移除。" if ok else "　防火牆規則沒有移除成功 (權限視窗按了「否」)，規則還在，可以按選歌畫面的「🛡 防火牆」再移除。"
+
+    def _back(self):
+        self.qr_lbl.setStyleSheet("")
+        self.stack.setCurrentIndex(0)
+
+    def closeEvent(self, e):
+        if self.srv:
+            self.srv.stop()
+            self.srv = None
+            self._fw_cleanup()                  # 分享到一半直接關視窗，也一樣照勾選處理
+        self.tm.stop()
+        super().closeEvent(e)
+
+
 class Player(QWidget):
     def __init__(self):
         super().__init__()
@@ -3950,6 +4483,13 @@ class Player(QWidget):
         sl.addWidget(self.search, 1)
         r1.addWidget(self.search_box, 1)
         self._apply_search()
+        self.share_btn = QPushButton("📱")
+        self.share_btn.setObjectName("clockbtn")
+        self.share_btn.setMinimumWidth(56)
+        self.share_btn.setFixedHeight(32)
+        self.share_btn.setToolTip("分享到手機: 勾選歌曲，手機掃 QR code 下載 (只在區域網路內，傳完自動關閉)")
+        self.share_btn.clicked.connect(self.open_share)
+        r1.addWidget(self.share_btn)
         self.clock_btn = QPushButton("⏱")
         self.clock_btn.setObjectName("clockbtn")
         self.clock_btn.setMinimumWidth(96)
@@ -4722,6 +5262,17 @@ class Player(QWidget):
     # ---------------- 桌布幻燈片 ----------------
     def open_slideshow(self):
         SlideshowDialog(self).exec()
+
+    def open_share(self):
+        if getattr(self, "_share", None) is not None and self._share.isVisible():
+            self._share.raise_()
+            self._share.activateWindow()
+            return
+        if not self.tracks:
+            QMessageBox.information(self, "分享到手機", "歌曲清單是空的，請先加入音樂資料夾。")
+            return
+        self._share = ShareDialog(self)
+        self._share.show()
 
     def set_wallpaper(self, path, fade=True):
         prev = self._background() if (fade and self.cfg["wp_fade"] and self.isVisible()) else None
