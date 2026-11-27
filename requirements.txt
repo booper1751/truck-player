@@ -4,3 +4,4 @@ mutagen
 keyboard
 edge-tts
 yt-dlp
+qrcode
